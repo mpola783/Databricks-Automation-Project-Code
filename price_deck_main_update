@@ -1,0 +1,181 @@
+#Imports
+import pandas as pd
+from pyspark.sql import DataFrame
+import os
+from datetime import datetime
+import pytz
+import shutil
+import re
+from pyspark.sql.types import StructType, StructField, StringType, DoubleType, IntegerType
+from pyspark.sql.functions import lit, first, collect_set, col, when, regexp_replace, desc, last, monotonically_increasing_id, round
+from pyspark.sql.window import Window
+from pyspark.sql import SparkSession
+import json
+# Functions 
+
+def return_files(root_path):
+    # Get a list of all files in the directory
+    files = os.listdir(root_path)
+    
+    # Add root_path before each value in files
+    files = [os.path.join(root_path, file) for file in files]
+    
+    # Filter out only files (excluding directories)
+    files = [file for file in files if os.path.isfile(file)]
+
+    return files
+
+
+def remove_matching_files(files, table_name, column_name):
+    # Get the distinct files from the table column
+    existing_files = spark.sql(f"SELECT DISTINCT {column_name} FROM {table_name}").toPandas()[column_name].tolist()
+    
+    # Filter the files list, removing any files that have a path already present in the table
+    filtered_files = [file for file in files if file not in existing_files]
+    
+    return filtered_files
+
+def remove_root_path(files, root_path):
+    return [file.replace(root_path, "") for file in files]
+
+
+def return_deleted_files(files, root_path):
+    existing_files = return_files(root_path)
+
+    deleted_files = [file for file in files if file not in existing_files]
+
+    return deleted_files
+
+def find_distinct_table_files(column_name, table_name, root_path):
+    files = spark.sql(f"SELECT DISTINCT {column_name} FROM {table_name}").toPandas()[column_name].tolist()
+    files = add_root_path(files, root_path)
+
+    deleted_files = return_deleted_files(files, root_path)
+
+    return deleted_files
+
+def add_root_path(files, root_path):
+    return [os.path.join(root_path, file) for file in files]
+
+def remove_rows_from_table(table_name, column_name, deleted_files):
+    deleted_files_str = ", ".join([f"'{x}'" for x in deleted_files])
+    spark.sql(f"""
+     DELETE FROM {table_name}
+     WHERE {column_name} IN ({deleted_files_str})
+    """)
+
+
+try:
+  forecast = dbutils.widgets.get("forecast")
+except:
+  forecast = "N/A"
+#Selects the catalog to make changes to based on passed parameter env
+#'main' = main catalog, 'dev' = developer catalog
+# check_table - Table used to test what files are loaded, Assumes all other table files are loaded with same files 
+# target_schema - schema in which tables are being altered (main or development)
+
+try:
+  env = dbutils.widgets.get("env")
+except Exception as e:
+  raise ValueError("Error loading 'env' parameter: " + str(e))
+
+if env == "dev":
+    root_path = '/Volumes/finance_secured/manufacturing_wrb_prod/price_deck_files/'
+    check_table = 'finance_secured.manufacturing_wrb_prod.price_deck_hsm'
+    target_schema = "finance_secured.manufacturing_wrb_prod"
+else:
+    root_path = '/Volumes/finance_secured/manufacturing_wrb/price_deck_files/'
+    check_table = 'finance_secured.manufacturing_wrb.price_deck_hsm'
+    target_schema = "finance_secured.manufacturing_wrb"
+%md
+This Notebook is Used to Clean Up (Reorder/Sort, Delete, Rename) Tables in WRB catalog
+%md
+UPLOAD ALL NEW FILES NOT UPLOADED INTO PRICE DECK
+#Finds new files added to the catalog
+#Stores new file paths in 'files' list
+
+
+files = return_files(root_path)
+files = remove_root_path(files, root_path)
+
+#Returns a list of files where the file name has not been loaded
+if spark.catalog.tableExists(check_table):
+    files = remove_matching_files(files, check_table, "file_desc")
+
+files = [root_path + file for file in files]
+print(files)
+
+#Load new files into tables
+for file_path in files:
+    # Husky Summary Monthly
+    dbutils.notebook.run("price_deck_load_hsm", 
+                         480, 
+                         {"file_path": file_path, "forecast_version": forecast, "env": env})
+ 
+    # Monthly Benchmarking
+    dbutils.notebook.run("price_deck_load_mb", 
+                         400, 
+                         {"file_path": file_path, "forecast_version": forecast, "env": env})
+ 
+    # Chicago Output
+    dbutils.notebook.run("price_deck_load_chicago", 
+                         400, 
+                         {"file_path": file_path, "forecast_version": forecast, "env": env})
+ 
+    # Group 3 Output
+    dbutils.notebook.run("price_deck_load_group3", 
+                         400, 
+                         {"file_path": file_path, "forecast_version": forecast, "env": env})
+
+%md
+REMOVE FILES DELETED FROM THE VOLUME
+#Find deleted files (files no longer in catalog that were loaded into tables)
+
+deleted_files = find_distinct_table_files("file_desc", check_table, root_path)
+deleted_files = remove_root_path(deleted_files, root_path)
+
+print(deleted_files)
+#Declare tables to delete from
+schema_tables = []
+if env == "dev":
+  schema_tables = [
+              'finance_secured.manufacturing_wrb_prod.price_deck_hsm',
+              'finance_secured.manufacturing_wrb_prod.price_deck_mb',
+              'finance_secured.manufacturing_wrb_prod.price_deck_chicago',
+              'finance_secured.manufacturing_wrb_prod.price_deck_group3',
+              'finance_secured.manufacturing_wrb_prod.price_deck_hsm_view_date',
+              'finance_secured.manufacturing_wrb_prod.price_deck_mb_view_date',
+              'finance_secured.manufacturing_wrb_prod.price_deck_chicago_view_date',
+              'finance_secured.manufacturing_wrb_prod.price_deck_group3_view_date',
+              'finance_secured.manufacturing_wrb_prod.price_deck_hsm_view_cat',
+              'finance_secured.manufacturing_wrb_prod.price_deck_mb_view_cat',
+              'finance_secured.manufacturing_wrb_prod.price_deck_chicago_view_cat',
+              'finance_secured.manufacturing_wrb_prod.price_deck_group3_view_cat'
+]
+  
+else:
+  schema_tables = [
+              'finance_secured.manufacturing_wrb.price_deck_hsm',
+              'finance_secured.manufacturing_wrb.price_deck_mb',
+              'finance_secured.manufacturing_wrb.price_deck_chicago',
+              'finance_secured.manufacturing_wrb.price_deck_group3',
+              'finance_secured.manufacturing_wrb.price_deck_hsm_view_date',
+              'finance_secured.manufacturing_wrb.price_deck_mb_view_date',
+              'finance_secured.manufacturing_wrb.price_deck_chicago_view_date',
+              'finance_secured.manufacturing_wrb.price_deck_group3_view_date',
+              'finance_secured.manufacturing_wrb.price_deck_hsm_view_cat',
+              'finance_secured.manufacturing_wrb.price_deck_mb_view_cat',
+              'finance_secured.manufacturing_wrb.price_deck_chicago_view_cat',
+              'finance_secured.manufacturing_wrb.price_deck_group3_view_cat'
+]
+  
+
+#Delete rows from table where file has been deleted
+if deleted_files:
+    for files in deleted_files:
+      for table in schema_tables:
+        remove_rows_from_table(table, "file_desc", deleted_files)
+%md
+REORDER AND FILTER COLUMNS
+%md
+------
