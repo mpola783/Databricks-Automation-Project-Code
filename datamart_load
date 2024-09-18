@@ -1,0 +1,2077 @@
+# Databricks notebook source
+# MAGIC %md
+# MAGIC This notebook loads new charge and yield / income statments into the datamart and adds additional calculated values 
+
+# COMMAND ----------
+
+#Imports
+
+import pandas as pd
+import os
+from datetime import datetime
+import pytz
+import shutil
+import re
+from pyspark.sql.types import StructType, StructField, StringType, DoubleType, IntegerType
+from pyspark.sql.functions import lit, first, collect_set, when, regexp_replace, desc, last, monotonically_increasing_id, expr
+from pyspark.sql.window import Window
+from pyspark.sql import SparkSession
+from pyspark.sql import functions as F
+from pyspark.sql.functions import col
+from pyspark.sql import DataFrame
+from pyspark.sql.functions import row_number
+from pyspark.sql.functions import sum as spark_sum
+
+# COMMAND ----------
+
+#Functions
+
+'''
+store_date, preprocess_file_name, extract_number
+Finds and returns the date based on 8 digits in the file_name
+'''
+def store_date(file_name):
+    date_month = extract_two_digit_num(file_name)
+    date_year = extract_four_digit_num(file_name)
+
+    date_month = date_list[int(date_month) - 1]
+
+    # Insert dashes after the 4th and 6th positions
+    date = date_month + '-' + date_year
+    return date
+
+
+'''
+Fixes Date formating
+'''
+def reverse_dates(list):
+  new_dates = []
+  for date in list:
+    if any(month in date for month in added_list):
+      date_month= date[5:]
+      date_month = re.sub(r'[-]', '', date_month)
+      index = added_list.index(date_month)
+      date_month = added_list[index]
+
+    else:
+      date_month = extract_two_digit_num(date)
+      date_month = date_list[int(date_month) - 1]
+    
+    date_year = extract_four_digit_num(date)
+
+    # Insert dashes after the 4th and 6th positions
+    new_date = date_month + '-' + date_year
+    new_dates.append(new_date)  # Fixed the error here
+  return new_dates
+
+def extract_two_digit_num(file_name):
+    pattern = r'\b\d{2}\b'  # Matches a sequence of 8 digits
+    match = re.search(pattern, file_name)
+    if match:
+        return match.group()
+    else:
+        return None
+
+def extract_four_digit_num(file_name):
+    pattern = r'\b\d{4}\b'  # Matches a sequence of 8 digits
+    match = re.search(pattern, file_name)
+    if match:
+        return match.group()
+    else:
+        return None
+
+
+'''
+Input: Column names and lookup values to find in table
+Output: Table Row with matching values in columns, should be just one
+'''
+def filter_table(table, column_desc, cond_file, cond_selected, cond_category):
+    filtered_df = table.filter(
+                    (col("file_date") == cond_file) &
+                    (col(column_desc)== cond_selected) &
+                    (col("category") == cond_category)
+                )
+
+    return filtered_df
+
+
+'''
+More flexibile version of filter_table
+Can filter table based on a desired number of conditions
+Input: Column names and lookup values to find in table
+Output: Table Row with matching values in columns, should be just one
+'''
+def search_table(table, column_desc_1, cond_1, column_desc_2, cond_2, column_desc_3, cond_3, conditions):
+    if conditions == 3:
+        filtered_df = table.filter(
+                        (col(column_desc_1) == cond_1) &
+                        (col(column_desc_2)== cond_2) &
+                        (col(column_desc_3) == cond_3)
+                    )
+    elif conditions == 2:
+        filtered_df = table.filter(
+                        (col(column_desc_1) == cond_1) &
+                        (col(column_desc_2)== cond_2)
+                    )
+    elif conditions == 1:
+        filtered_df = table.filter(
+                        (col(column_desc_1) == cond_1)
+                    )
+    else:
+        raise ValueError("Invalid Number of Exceptions")
+        filtered_df = None
+
+    return filtered_df
+
+
+'''
+Given a row of a table
+Collects the value at the desired column
+'''
+def collect_value(spark_df, column):
+    
+    value_list = spark_df.select(column).collect()
+
+    if value_list:
+        # Extract the first value from the list
+        value = value_list[0][column]
+    else:
+        value = None
+    
+    return value
+
+
+'''
+Updates value in spark_df at designated row
+Rows are updated in acending order from starting_row, calculated based on the number of calculations preceded
+'''
+def update_new_value(spark_df, value, starting_row, num_calc, num_material, calculation_order, column):
+    # Update the spark_df with the new value in the corresponding column
+    spark_df = spark_df.withColumn(column,
+        when(col("row_id") == (starting_row + num_calc + (len(calculation_order) * num_material)),
+                lit(value)
+            ).otherwise(col(column)))
+    
+    return spark_df    
+
+
+'''
+A variation of the function filter_table, finds the desired value in both borger and wood river files
+Input: Column names and lookup values to find in tables
+Output: Table Row with matching values in columns, should be just one for each file
+'''
+def get_wrb_values(table_wr, table_bor, fetch_table_column, new_date, material_order, calc_order, collect_table_column):
+                value_row_wr = filter_table(table_wr, fetch_table_column, new_date, material_order, calc_order)
+                value_wr = collect_value(value_row_wr, collect_table_column)
+
+                value_row_bor = filter_table(table_bor, fetch_table_column, new_date, material_order, calc_order)
+                value_bor = collect_value(value_row_bor, collect_table_column)
+
+                value_wr = value_wr if value_wr is not None else 0
+                value_bor = value_bor if value_bor is not None else 0
+
+                return value_wr, value_bor
+            
+'''
+A variation of the function collect_value
+Given a row of a table
+Collects the value at the desired column for both borger and wood river
+Adds the two values together and returns the result
+'''
+def combine_values(table_1, table_2, new_date, row_desc_1, row_desc_2, fetch_column, calculation, collect_column):
+                value_1 = collect_value(filter_table(table_1, fetch_column, new_date, row_desc_1, calculation), collect_column)
+
+                value_2 = collect_value(filter_table(table_2, fetch_column, new_date, row_desc_2, calculation), collect_column)
+
+                value_1 = value_1 if value_1 is not None else 0
+                value_2 = value_2 if value_2 is not None else 0
+                value = value_1 + value_2
+
+                return value
+
+'''
+Returns a new list where format 'Jan-2024' is changed to '2024-01'
+'''
+def change_date_format(new_files, date_list, date_number):
+    new_dates = [''] * len(new_files) # Initialize new_dates with the correct size
+    for file, file_num in zip(new_files, range(len(new_files))):
+        if any(string in file for string in added_list):
+            if "YTD" in file:
+                new_dates[file_num] = file[4:] + "-" + file[:3]
+            else:
+                new_dates[file_num] = file[3:] + "-" + file[:2]
+        else: 
+            index = date_list.index(file[:3])
+            if index is not None:
+                new_dates[file_num] = file[4:] + "-" + date_number[index]
+
+
+    return new_dates
+
+'''
+Creates a new column in spark_df as the Quarter Average depending on the quarter given
+Requires all month columns within Quarter period to be present in spark_df 'Jan-2024, Feb-2024, Mar-2024' = Full Q1 set
+'''
+def add_quarter(spark_df, quarter_months, quarter_text, date_year):
+    first_month = (quarter_months[0] + '-' + date_year)
+    second_month = (quarter_months[1] + '-' + date_year)
+    third_month = (quarter_months[2] + '-' + date_year)
+
+    if first_month in spark_df.columns and second_month in spark_df.columns and third_month in spark_df.columns:
+        # Create a new column with the desired logic
+        spark_df = spark_df.withColumn(
+            quarter_text + '-' + date_year,
+            when(
+                (col("Calculation") == "Actual M$") | (col("Calculation") == "MBbls"),
+                col(first_month) + col(second_month) + col(third_month)
+            ).otherwise(
+                (col(first_month) + col(second_month) + col(third_month)) / 3
+            )
+        )
+    
+    return spark_df
+
+'''
+Creates a new column in spark_df as the Year To Date Average
+Requires all month columns within Current Year to be present in spark_df 'Jan-2024, Feb-2024... Dec-2024' = Full YTD set
+
+def add_ytd(spark_df, date_year):
+    loaded_months = 0
+    month_cols = []
+
+    for date in date_list:
+        if (date + '-' + date_year) in spark_df.columns:
+            loaded_months = loaded_months + 1
+            month_cols.append(date + '-' + date_year)
+    
+    
+    if loaded_months == 12:
+        spark_df = spark_df.withColumn(
+            ("YTD" + '-' + date_year),
+            (col("Q1-" + date_year) + col("Q2-" + date_year) + col("Q3-" + date_year) + col("Q4-" + date_year)) / 4)
+    
+    spark_df = spark_df.withColumn(
+            ("YTD" + '-' + date_year),
+            (col(month_cols[0]) + col(month_cols[1]) + col(month_cols[2])... / loaded_months)
+
+    return spark_df
+'''
+
+'''
+Creates a new column in spark_df as the Year To Date Average
+Requires all month columns within Current Year to be present in spark_df 'Jan-2024, Feb-2024... Dec-2024' = Full YTD set
+'''
+def add_ytd(spark_df, date_year):
+    loaded_months = 0
+    month_cols = []
+    spark_df = spark_df.drop(f"YTD-{date_year}")
+
+    # Collect valid month-year columns
+    for date in date_list:
+        column_name = f"{date}-{date_year}"
+        if column_name in spark_df.columns:
+            loaded_months += 1
+            month_cols.append(column_name)
+    
+    # If no valid month columns, return the dataframe as is
+    if loaded_months > 0:
+        # Add the YTD column by summing all valid month columns
+        sum_expr = sum(col(month) for month in month_cols)
+
+        # Add new YTD column and divide by the number of loaded months
+        spark_df = spark_df.withColumn(f"YTD-{date_year}", sum_expr / loaded_months)
+
+    return spark_df
+
+'''
+Gets a platts number from the platts number reference table based on the date given
+'''
+def get_platts(date):
+    temp_df = spark.sql(f"SELECT * FROM {platts_table}")
+    platts_list = []
+
+    for date in new_files:
+
+        matching_rows_df = temp_df.filter(col("Date") == lit(date))
+
+        # If there are matching rows, update the Platts_Number for those rows
+        if matching_rows_df.count() > 0:
+            platts_number = matching_rows_df.collect()[0].Platts_Number
+            platts_list.append(platts_number)
+        else:
+            raise Exception("Platts number for new date was not found in platts reference table")
+
+    print(platts_list)
+    return platts_list
+
+date_list = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+date_number = ["01", "02", "03", "04", "05", "06", "07", "08", "09", "10", "11", "12"]
+added_list = ["Q1", "Q2", "Q3", "Q4", "YTD"]
+
+income_statement_tables_main = [
+    '',
+    '',
+    '',
+    ''
+]
+
+income_statement_tables_dev = [
+    '',
+    '',
+    '',
+    ''
+]
+
+table_desc = [
+
+]
+
+# COMMAND ----------
+
+# Pass in parameters 
+try:
+    env = dbutils.widgets.get("env")
+    reload_date = dbutils.widgets.get("reload_date")
+except Exception as e:
+    raise ValueError("Failed to retrieve notebook widgets. Ensure 'file_path' and 'env' are provided.")
+    #env = "dev"
+    #reload_date = "Aug-2024"
+
+# COMMAND ----------
+
+#Define main variables
+#'main' is main catalog environment, 'dev' is production schema environment
+# Three tables are defined to be loaded, main, and two views for alternative purposes
+
+#if in development
+if(env == "dev"):
+    #Table Paths
+    main_table_path_cy =  ''
+    expanded_table_path_cy =  ''
+    expanded_table_path_income =  ''
+    main_table_path_income =  ''
+    directory_path = ''
+
+    income_statement_tables = income_statement_tables_dev
+
+else:
+    main_table_path_cy = ''
+    expanded_table_path_cy =  ''
+    expanded_table_path_income =  ''
+    main_table_path_income =  ''
+    directory_path = '/Volumes'
+
+    income_statement_tables = income_statement_tables_main
+
+
+platts_table = ''
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC **Income Statements**
+
+# COMMAND ----------
+
+#Merges Income Statement Tables into one Table
+next_row_id = 0
+
+datamart_income_table = None
+for table, desc in zip(income_statement_tables, table_desc):
+    temp_df = spark.sql(f"SELECT * FROM {table}")
+    temp_df = temp_df.withColumn('table', lit(desc))
+    temp_df = temp_df.drop('row_id').withColumn("row_id", monotonically_increasing_id() + next_row_id)
+    next_row_id = temp_df.agg({"row_id": "max"}).collect()[0][0] + 1
+    temp_df = temp_df.select('row_id', 'table', *[col for col in temp_df.columns if col not in ['row_id', 'table']])
+    if datamart_income_table is None:
+        datamart_income_table = temp_df
+    else:
+        datamart_income_table = datamart_income_table.union(temp_df)
+
+
+# COMMAND ----------
+
+display(datamart_income_table)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC Unpivot Income Statement Tables 
+
+# COMMAND ----------
+
+
+# Unvpivot (Merge) Columns in Spark_DF into one column 'value'
+
+columns_to_unpivot = datamart_income_table.columns[16:]
+    
+stack_expr = "stack({}, {}) as (category, value)".format(len(columns_to_unpivot), ", ".join([f"'{col}', `{col}`" for col in columns_to_unpivot]))
+    
+datamart_income_table = datamart_income_table.select("row_id", "table", "latest_file_date", "latest_file_desc", "processed_timestamp", "G/L_Account", "G/L_Account_Code", "Node_Lvl1", "Node_Lvl2", "Node_Lvl3", "Node_Lvl4", "Node_Lvl5", "Node_Lvl6", "Node_Lvl7", "Node_Lvl8", "Node_Lvl9", expr(stack_expr))
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC **CALCULATIONS**
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC **Charge and Yield**
+
+# COMMAND ----------
+
+from pyspark.sql.functions import col
+#LOAD EXISTING OR NEW TABLE CONTENTS
+
+if not spark.catalog.tableExists(expanded_table_path_cy):
+    # Loads Historic File if Needed
+    file_path = '/Volumes/'
+
+    df = pd.read_excel(file_path, skiprows=0, header=0)
+
+    # CLEANUP - REMOVE STRINGS FROM VALUE ROWS (Turns them into NaN Values), REMOVE UNNAMED COLUMNS, 
+    for col in df.columns[4:]:
+        df[col] = pd.to_numeric(df[col], errors='coerce')
+
+    spark_df = spark.createDataFrame(df)
+
+    new_columns = [col for col in spark_df.columns if "Unnamed" not in col and not col[0].isdigit()]
+    spark_df = spark_df.select(new_columns)
+
+    from pyspark.sql.functions import col
+    spark_df = spark_df.filter(
+        ~col("Material_Group").isNull())
+
+else:
+    spark_df = spark.sql(f"SELECT * FROM {expanded_table_path_cy} WHERE datamart_desc != '50% Net'")
+
+# COMMAND ----------
+
+'''
+Load Woodriver and Borger Charge and Yield Tables
+'''
+
+woodriver_cy_table_path = ''
+woodriver_earnings_table_path = ''
+
+borger_cy_table_path = ''
+borger_earnings_table_path = ''
+
+woodriver_cy = spark.sql(f"SELECT * FROM {woodriver_cy_table_path} ORDER BY file_date DESC")
+woodriver_earnings = spark.sql(f"SELECT * FROM {woodriver_earnings_table_path} ORDER BY file_date DESC")
+
+borger_cy = spark.sql(f"SELECT * FROM {borger_cy_table_path} ORDER BY file_date DESC")
+borger_earnings = spark.sql(f"SELECT * FROM {borger_earnings_table_path} ORDER BY file_date DESC")
+
+
+'''
+Load Price deck / income statements for value reference
+'''
+price_deck_monthly_table_path = '' 
+price_deck_monthly = spark.sql(f"SELECT * FROM {price_deck_monthly_table_path} ORDER BY file_date DESC")
+
+income_statement_woodriver_path = ''
+income_statement_woodriver = spark.sql(f"SELECT * FROM {income_statement_woodriver_path}")
+
+income_statement_borger_path = ''
+income_statement_borger = spark.sql(f"SELECT * FROM {income_statement_borger_path}")
+
+
+
+# COMMAND ----------
+
+#Finds files in Charge Yield Files not loaded into Datamart
+#Output : new_files (stores the Dates of the files not loaded )
+#         new_dates (stores the Dates used to search in charge and yield tables)
+
+#Checking table woodriver_cy_table_path for reference, assuming all tables loaded same files
+file_dates_df_woodriver = spark.sql(f"SELECT DISTINCT file_date FROM {woodriver_cy_table_path} ORDER BY file_date")
+file_dates_df_borger = spark.sql(f"SELECT DISTINCT file_date FROM {borger_cy_table_path} ORDER BY file_date")
+
+list_woodriver = [str(date.file_date) for date in file_dates_df_woodriver.collect()]
+list_borger = [str(date.file_date) for date in file_dates_df_borger.collect()] #collects the file_date row value
+
+file_date_list_woodriver = [store_date(list_woodriver[i]) for i in range(len(list_woodriver))] #convert to list
+file_date_list_borger = [store_date(list_borger[i]) for i in range(len(list_borger))]
+
+#Finds the file dates not in the datamart 
+new_files_wooodriver = [column for column in file_date_list_woodriver if column not in spark_df.columns]
+print(new_files_wooodriver)
+new_files_borger = [column for column in file_date_list_borger if column not in spark_df.columns]
+
+if(new_files_wooodriver != new_files_borger):
+  raise Exception("Unbalanced number of Charge and Yield Files: WoodRiver and Borger")
+
+new_files = new_files_wooodriver
+
+if len(reload_date) == 8:
+  new_files.append(reload_date)
+
+new_dates = change_date_format(new_files, date_list, date_number)
+
+print(new_files)
+print(new_dates)
+
+# COMMAND ----------
+
+platts_list = get_platts(new_files)
+
+# COMMAND ----------
+
+#Create Row ID Column for Calculation Row Reference
+
+for i in range(len(new_files)):
+  spark_df = spark_df.withColumn(new_files[i], lit(None))
+
+spark_df = spark_df.drop("row_id") if "row_id" in spark_df.columns else spark_df
+spark_df = spark_df.withColumn("row_id", monotonically_increasing_id())
+
+# COMMAND ----------
+
+# Assuming spark is your SparkSession
+spark.sparkContext.setCheckpointDir('')
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC WOOD RIVER - Processed Inputs - LIFO
+# MAGIC
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC Loading Data Values -
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC LOGIC - Use Lists containing column values that together reference a specific row in the Charge and Yield table. One by one extract values and load them into the new datamart column
+
+# COMMAND ----------
+
+display(woodriver_cy)
+
+# COMMAND ----------
+
+#WoodRiver
+#Processed Inputs - LIFO Update Values
+material_type_order = ["Crude", "Input Other", "Input"]
+calc_order = ["M-bbl 60°F/Day", "%PI", "M-bbl 60°F", "M-$", "$/bbl 60°F"]
+fetch_table_column = "Material"
+collect_table_column = "value"
+
+table = woodriver_cy
+starting_row = 0
+
+# Changes from Datamart - "$/bbl 60°F" is taken directly from C&Y instead of doing calculation 
+
+for num_col in range(len(new_files)):
+        for num_material in range(len(material_type_order)):
+            for num_calc in range(len(calc_order)):
+        
+              value_row = filter_table(table, fetch_table_column, new_dates[num_col], material_type_order[num_material], calc_order[num_calc])
+              value = collect_value(value_row, collect_table_column)
+
+              #Flip value
+              if calc_order[num_calc] in ["M-bbl 60°F/Day", "M-bbl 60°F", "M-$"]:
+                if value != None:
+                  value = -value
+
+              #Load Value
+              spark_df = update_new_value(spark_df, value, starting_row, num_calc, num_material, calc_order, new_files[num_col])  
+              print(new_files[num_col], num_col, num_material, num_calc)
+              print(value)
+
+# COMMAND ----------
+
+#WoodRiver
+#Finished Products - Update Values
+material_type_order = ["Output Motor Fuel", "JET A", "Output Distillates", "Output Other Cleans", "Output Clean Products", "Output Finished NGLs", "Output Fixed Price Products", "Output Asphalts", "Output Fuel Coke", "Output Sulfur/Acid", "Output Other Products", "Finished Products"]
+calc_order = ["M-bbl 60°F/Day", "%PI", "M-bbl 60°F", "M-$", "$/bbl 60°F"]
+fetch_table_column = "Material"
+collect_table_column = "value"
+
+table = woodriver_cy
+starting_row = 15
+
+material_cleans_addition = ["Output Solvents", "Output Aromatics"]
+
+#Special Conditions - 1. Total Clean Products is the combination of Solvents, aromatics and cleans
+#                     2. "$/bbl 60°F" needs to be calculated based on "M-bbl 60°F", "M-$" calculations, (is also a column in c&y)
+
+for num_col in range(len(new_files)):
+        for num_material in range(len(material_type_order)):
+            for num_calc in range(len(calc_order)):
+        
+              value_row = filter_table(table, fetch_table_column, new_dates[num_col], material_type_order[num_material], calc_order[num_calc])
+              value = collect_value(value_row, collect_table_column)
+
+              #Can't extract value for the addition - must be calculated 
+              if material_type_order[num_material] == "Output Other Cleans":
+                  for group in material_cleans_addition:
+                    if calc_order[num_calc] == "$/bbl 60°F":
+                      value = m_dollar_value / mbbl_value if mbbl_value != 0 else m_dollar_value
+                    else:
+                      value_addition_row = filter_table(table, fetch_table_column, new_dates[num_col], group, calc_order[num_calc])
+                      value_addition = collect_value(value_addition_row, collect_table_column)
+
+                      value_addition = value_addition if value_addition is not None else 0
+                      value = value if value is not None else 0
+                      value = value + value_addition
+
+                      if calc_order[num_calc] == "M-$":
+                        m_dollar_value = value if value is not None else 0
+
+                      elif calc_order[num_calc] == "M-bbl 60°F":
+                        mbbl_value = value if value is not None else 0
+
+              #Load value
+              spark_df = update_new_value(spark_df, value, starting_row, num_calc, num_material, calc_order, new_files[num_col])  
+              print(new_files[num_col], num_col, num_material, num_calc)
+              print(value)
+
+# COMMAND ----------
+
+#WoodRiver
+#Earnings Values
+material_type_order = ["CY Distribution Costs", "Discontinued Column", "CY Additives", "CY RINS", "CY Other Revenues", "CY Other Expenses and Revenue", 
+                       "CY Reclasses & Gain Loss", "CY Inventory Impact (Indirect Costs)", "CY Hedging", "CY Margin Adjustments"]
+calc_order = ["Current_Month_Actuals"]
+fetch_table_column = "G/L_Account"
+collect_table_column = "value"
+
+table = woodriver_earnings
+starting_row = 75
+
+for num_col in range(len(new_files)):
+        for num_material in range(len(material_type_order)):
+            for num_calc in range(len(calc_order)):
+        
+              value_row = filter_table(table, fetch_table_column, new_dates[num_col], material_type_order[num_material], calc_order[num_calc])
+              value = collect_value(value_row, collect_table_column)
+
+              spark_df = update_new_value(spark_df, value, starting_row, num_calc, num_material, calc_order, new_files[num_col])  
+              print(new_files[num_col], num_col, num_material, num_calc)
+              print(value)
+
+# COMMAND ----------
+
+#Wood River
+#Added Calcs
+material_type_order = ["Finished Products"]
+material_type_subtraction = ["Output Consumed in Operations"]
+calc_order = ["%PI", "M-bbl 60°F/Day", "M-bbl 60°F"]
+fetch_table_column = "Material"
+collect_table_column = "value"
+
+table = woodriver_cy
+starting_row = 85
+
+
+#Special Calculation - 1. These calculations are a result of a subtraction between two searched values in the C&Y
+
+for num_col in range(len(new_files)):
+        for num_material in range(len(material_type_order)):
+            for num_calc in range(len(calc_order)):
+        
+              value_row = filter_table(table, fetch_table_column, new_dates[num_col], material_type_order[num_material], calc_order[num_calc])
+              value = collect_value(value_row, collect_table_column)
+
+              value_row_subtraction = filter_table(table, fetch_table_column, new_dates[num_col], material_type_subtraction[num_material], calc_order[num_calc])
+              value_subtraction = collect_value(value_row_subtraction, collect_table_column)
+              
+              if value_subtraction:
+                value = value - value_subtraction
+
+              spark_df = update_new_value(spark_df, value, starting_row, num_calc, num_material, calc_order, new_files[num_col])  
+              print(new_files[num_col], num_col, num_material, num_calc)
+              print(value)
+
+# COMMAND ----------
+
+#Borger
+#Processed Inputs - LIFO Update Values
+material_type_order = ["Crude", "Input Other", "Discontinued Rows", "Input"]
+calc_order = ["M-bbl 60°F/Day", "%PI", "M-bbl 60°F", "M-$", "$/bbl 60°F"]
+fetch_table_column = "Material"
+collect_table_column = "value"
+
+table = borger_cy
+starting_row = 88
+
+for num_col in range(len(new_files)):
+        for num_material in range(len(material_type_order)):
+            for num_calc in range(len(calc_order)):
+        
+              value_row = filter_table(table, fetch_table_column, new_dates[num_col], material_type_order[num_material], calc_order[num_calc])
+              value = collect_value(value_row, collect_table_column)
+
+              #Flip Value
+              if calc_order[num_calc] in ["M-bbl 60°F/Day", "M-bbl 60°F", "M-$"]:
+                if value != None:
+                  value = -value
+
+              spark_df = update_new_value(spark_df, value, starting_row, num_calc, num_material, calc_order, new_files[num_col])  
+              print(new_files[num_col], num_col, num_material, num_calc)
+              print(value)
+
+# COMMAND ----------
+
+#Borger
+#Finished Products - Update Values
+material_type_order = ["Output Motor Fuel", "JET A", "Discontinued Row JP8 Jet", "Discontinued Row Philijet", "Output Distillates", "Output Solvents", "Output Clean Products", "Output Finished NGLs", "Output Fixed Price Products", "Discontinued Row Asphalts", "Output Fuel Coke", "Output Sulfur/Acid", "Output Other Products", "Finished Products"]
+
+calc_order = ["M-bbl 60°F/Day", "%PI", "M-bbl 60°F", "M-$", "$/bbl 60°F"]
+
+material_added_addition = "Output Raw NGLs"
+fetch_table_column = "Material"
+collect_table_column = "value"
+
+table = borger_cy
+starting_row = 108
+
+#Special Conditions - 1. Total 'NGL's' is the combination of Finished and Raw NGL's
+#                     2. "$/bbl 60°F" needs to be calculated based on "M-bbl 60°F", "M-$" calculations
+
+for num_col in range(len(new_files)):
+        for num_material in range(len(material_type_order)):
+            for num_calc in range(len(calc_order)):
+        
+              value_row = filter_table(table, fetch_table_column, new_dates[num_col], material_type_order[num_material], calc_order[num_calc])
+              value = collect_value(value_row, collect_table_column)
+
+              #Can't extract value for the addition - must be calculated
+              if material_type_order[num_material] == "Output Finished NGLs":
+                if calc_order[num_calc] == "$/bbl 60°F":
+                  value = m_dollar_value / mbbl_value if mbbl_value != 0 else m_dollar_value
+
+                else:
+                  value_addition_row = filter_table(table, fetch_table_column, new_dates[num_col], material_added_addition, calc_order[num_calc])
+                  value_addition = collect_value(value_addition_row, collect_table_column)
+
+                  value_addition = value_addition if value_addition is not None else 0
+                  value = value if value is not None else 0
+                  value = value + value_addition
+
+                  if calc_order[num_calc] == "M-$":
+                    m_dollar_value = value if value is not None else 0
+
+                  elif calc_order[num_calc] == "M-bbl 60°F":
+                    mbbl_value = value if value is not None else 0
+
+              #Flip Value
+              if calc_order[num_calc] in ["%PI"]:
+                if value != None:
+                  value = -value
+
+              spark_df = update_new_value(spark_df, value, starting_row, num_calc, num_material, calc_order, new_files[num_col])  
+              print(new_files[num_col], num_col, num_material, num_calc)
+              print(value)
+
+# COMMAND ----------
+
+#Borger
+#Earnings Values
+material_type_order = ["CY Distribution Costs", "Discontinued Column Sales Misc", "CY Additives", "CY RINS", "CY Other Revenues", "CY Other Expenses and Revenue", "CY Reclasses & Gain Loss", "CY Inventory Impact (Indirect Costs)", "Discontinued Row CY Hedging", "CY Margin Adjustments"]
+
+calc_order = ["Current_Month_Actuals"]
+fetch_table_column = "G/L_Account"
+collect_table_column = "value"
+
+table = borger_earnings
+starting_row = 178
+
+for num_col in range(len(new_files)):
+        for num_material in range(len(material_type_order)):
+            for num_calc in range(len(calc_order)):
+        
+              value_row = filter_table(table, fetch_table_column, new_dates[num_col], material_type_order[num_material], calc_order[num_calc])
+              value = collect_value(value_row, collect_table_column)
+
+              spark_df = update_new_value(spark_df, value, starting_row, num_calc, num_material, calc_order, new_files[num_col])  
+              print(new_files[num_col], num_col, num_material, num_calc)
+              print(value)
+
+# COMMAND ----------
+
+#Borger
+#Added Calcs
+material_type_order = ["Finished Products"]
+material_type_subtraction = ["Output Consumed in Operations"]
+calc_order = ["%PI", "M-bbl 60°F/Day", "M-bbl 60°F"]
+fetch_table_column = "Material"
+collect_table_column = "value"
+
+table = borger_cy
+starting_row = 188
+
+#Special Calculation - 1. These calculations are a result of a subtraction between two searched values in the C&Y
+
+for num_col in range(len(new_files)):
+        for num_material in range(len(material_type_order)):
+            for num_calc in range(len(calc_order)):
+        
+              value_row = filter_table(table, fetch_table_column, new_dates[num_col], material_type_order[num_material], calc_order[num_calc])
+              value = collect_value(value_row, collect_table_column)
+
+              value_row_subtraction = filter_table(table, fetch_table_column, new_dates[num_col], material_type_subtraction[num_material], calc_order[num_calc])
+              value_subtraction = collect_value(value_row_subtraction, collect_table_column)
+
+              if value_subtraction:
+                value = value - value_subtraction
+
+              #Flip Value
+              if calc_order[num_calc] in ["%PI"]:
+                if value != None:
+                  value = -value
+
+              #Update Table    
+              spark_df = update_new_value(spark_df, value, starting_row, num_calc, num_material, calc_order, new_files[num_col])  
+              print(new_files[num_col], num_col, num_material, num_calc)
+              print(value)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC WRB COMBINE VALUES
+
+# COMMAND ----------
+
+spark_df = spark_df.checkpoint()
+
+# COMMAND ----------
+
+#WRB
+#Processed Inputs - LIFO Update Values
+material_type_order = ["Crude", "Input Other", "Discontinued Rows", "Input"]
+
+calc_order = ["M-bbl 60°F/Day", "M-bbl 60°F", "M-$", "$/bbl 60°F"]
+
+fetch_table_column = "Material"
+collect_table_column = "value"
+
+table_wr = woodriver_cy
+table_bor = borger_cy
+starting_row = 191
+
+#Special Conditions - 1."$/bbl 60°F" needs to be calculated based on "M-bbl 60°F", "M-$" calculations
+
+for num_col in range(len(new_files)):
+        for num_material in range(len(material_type_order)):
+            for num_calc in range(len(calc_order)):
+              
+              value_wr, value_bor = get_wrb_values(table_wr, table_bor, fetch_table_column, new_dates[num_col], material_type_order[num_material], calc_order[num_calc], collect_table_column)
+
+
+              '''
+              #SPECIAL CONDITION HANDLING
+              '''
+              if calc_order[num_calc] == "$/bbl 60°F":
+                value = m_dollar_value / mbbl_value if mbbl_value != 0 else m_dollar_value
+                value = value if value != 0 else None
+
+              else:
+                value = value_wr + value_bor
+
+              #Flip Value
+              if calc_order[num_calc] in ["M-bbl 60°F/Day", "M-bbl 60°F", "M-$"]:
+                if value != None:
+                  value = -value
+              '''
+              #END OF SPECIAL CONDITION HANDLING
+              '''
+              
+              #Update Table
+              spark_df = update_new_value(spark_df, value, starting_row, num_calc, num_material, calc_order, new_files[num_col])  
+              
+              #Store for easy Reference in next Calc
+              if calc_order[num_calc] == "M-bbl 60°F":
+                  mbbl_value = value
+                  mbbl_value = mbbl_value if mbbl_value is not None else 0
+
+              elif calc_order[num_calc] == "M-$":
+                  m_dollar_value = value
+                  m_dollar_value = m_dollar_value if m_dollar_value is not None else 0
+              
+
+              print(new_files[num_col], num_col, num_material, num_calc)
+              print(value)
+
+# COMMAND ----------
+
+#WRB
+#Finished Products - Update Values
+material_type_order = ["Output Motor Fuel", "JET A", "Output Distillates", "Output Clean Products", "Output Finished NGLs", "Output Fixed Price Products", "Output Asphalts", "Output Fuel Coke", "Output Sulfur/Acid", "Output Other Products", "Finished Products"]
+calc_order = ["M-bbl 60°F/Day", "%PI", "M-bbl 60°F", "M-$", "$/bbl 60°F"]
+
+pi_divident_calc_order = ["M-bbl 60°F", "M-bbl 60°F", "M-bbl 60°F", "M-bbl 60°F", "M-bbl 60°F", "M-bbl 60°F", "M-bbl 60°F/Day", "M-bbl 60°F/Day", "M-bbl 60°F/Day", "M-bbl 60°F"]
+
+pi_divisor_material_order = ["Input", "Input", "Input", "Input", "Input", "Input", "Output Fixed Price Products", "Output Fixed Price Products", "Output Asphalts", "Input"]
+pi_divisor_calc_order = ["M-bbl 60°F", "M-bbl 60°F", "M-bbl 60°F", "M-bbl 60°F", "M-bbl 60°F", "M-bbl 60°F", "M-bbl 60°F/Day", "M-bbl 60°F/Day", "M-bbl 60°F/Day", "M-bbl 60°F"]
+
+material_added_addition = "Output Raw NGLs"
+
+fetch_column = "Material"
+collect_column = "value"
+
+table_wr = woodriver_cy
+table_bor = borger_cy
+starting_row = 207
+repeat_row = False
+
+#Special Conditions - 1."$/bbl 60°F" needs to be calculated based on "M-bbl 60°F", "M-$" calculations, (always comes after so we store previous values to reduce redundancy)
+#                     2. NGL's for Borger - must add Raw NGL's and Finished NGL's
+
+for num_col in range(len(new_files)):  
+    repeat_row = False #Reset starting_row for the skipped_row
+
+    for num_material in range(len(material_type_order)):
+        for num_calc in range(len(calc_order)):
+
+              value_wr, value_bor = get_wrb_values(table_wr, table_bor, fetch_column, new_dates[num_col], material_type_order[num_material], calc_order[num_calc], collect_column)
+              
+              '''
+              #SPECIAL CONDITION HANDLING
+              '''
+              #Output Finished NGLs in Borger doesn't contain the full value, must add Output Raw NGL's
+              if material_type_order[num_material] == "Output Finished NGLs":
+                if calc_order[num_calc] != "$/bbl 60°F": # Will execute later in code
+                  value_bor = combine_values(table_bor, table_bor, new_dates[num_col], "Output Finished NGLs", "Output Raw NGLs", fetch_column, calc_order[num_calc], collect_column)
+
+              #SPECIFIC CALC FOR %PI 
+              if calc_order[num_calc] == "%PI" and material_type_order[num_material] != "Finished Products":
+                  
+                  #USED FOR DIVISION CALCULATION
+                  #Divisor
+                  divisor_value_wr, divisor_value_bor = get_wrb_values(table_wr, table_bor, fetch_column, new_dates[num_col], pi_divisor_material_order[num_material], pi_divisor_calc_order[num_material], collect_column)
+
+                  divisor_value_pi = divisor_value_bor + divisor_value_wr
+
+                  #Divident
+                  divident_value_wr, divident_value_bor = get_wrb_values(table_wr, table_bor, fetch_column, new_dates[num_col], material_type_order[num_material], pi_divident_calc_order[num_material], collect_column)
+
+                  #Must add Output Raw NGL's to divident value for NGLS
+                  if(material_type_order[num_material] == "Output Finished NGLs"):
+                     divident_value_bor = combine_values(table_bor, table_bor, new_dates[num_col], "Output Finished NGLs", "Output Raw NGLs", fetch_column, pi_divident_calc_order[num_material], collect_column)
+
+                  divident_value_pi = divident_value_bor + divident_value_wr
+
+                  #Calculation Total
+                  value = (divident_value_pi / divisor_value_pi) * 100 if divisor_value_pi != 0 else (divident_value_pi) * 100
+              
+              #SPECIFIC CALC FOR "$/bbl 60°F"
+              elif calc_order[num_calc] == "$/bbl 60°F":
+                value = m_dollar_value / mbbl_value if mbbl_value != 0 else m_dollar_value
+
+              else:
+                value = value_wr + value_bor
+
+                #Store values for easy reference in pi + $/bbl
+                if calc_order[num_calc] == "M-bbl 60°F":
+                  mbbl_value = value
+                  mbbl_value = mbbl_value if mbbl_value is not None else 0
+
+                elif calc_order[num_calc] == "M-$":
+                  m_dollar_value = value
+                  m_dollar_value = m_dollar_value if m_dollar_value is not None else 0
+                
+                elif calc_order[num_calc] == "M-bbl 60°F/Day":
+                  mbbl_value_day = value
+                  mbbl_value_day = mbbl_value_day if mbbl_value_day is not None else 0
+
+              #Flip Value
+              if calc_order[num_calc] in ["%PI"]:
+                if value != None:
+                  if mbbl_value_day < 0:
+                    value = -value
+                  else:
+                    value = abs(value)                       
+              '''
+              #END OF SEPCIAL CONDITION HANDLING
+              '''
+
+              #Update table with value, skip over specific row
+              if material_type_order[num_material] != "Finished Products" or calc_order[num_calc] != "%PI":
+                if repeat_row != True:
+                  spark_df = update_new_value(spark_df, value, starting_row, num_calc, num_material, calc_order, new_files[num_col])
+                else:
+                  temp_value = starting_row - 1
+                  spark_df = update_new_value(spark_df, value, temp_value, num_calc, num_material, calc_order, new_files[num_col])
+              else:
+                  repeat_row = True
+
+              print(new_files[num_col], num_col, num_material, num_calc)
+              print(value)
+
+# COMMAND ----------
+
+#Values Needed for Additional Calculations
+
+#PRICE DECK WTI VALUE -> Crude/Feedstock Advantage
+max_file_date_pd = price_deck_monthly.agg({"file_date": "max"}).collect()[0][0]
+print(max_file_date_pd, '\n')
+
+price_deck_wti_value = [None] * len(new_files)  # Initialize the list with the correct size
+income_total_revenue_value_wr = [None] * len(new_files)  # Initialize the list with the correct size
+income_purchases_value_wr = [None] * len(new_files)  # Initialize the list with the correct size
+income_total_revenue_value_bor = [None] * len(new_files)  # Initialize the list with the correct size
+income_purchases_value_bor = [None] * len(new_files)  # Initialize the list with the correct size
+
+for num_col in range(len(new_files)):
+
+    price_deck_wti_value_row = search_table(price_deck_monthly, "file_date", max_file_date_pd, "benchmark", "WTI @ Cushing", "category", "World Benchmarks", 3)
+    price_deck_wti_value[num_col] = collect_value(search_table(price_deck_wti_value_row, "period", new_dates[num_col], None, None, None, None, 1), "value")
+
+    #Income Statement Values
+    income_total_revenue_value_wr[num_col] = collect_value(search_table(income_statement_woodriver, "G/L_Account", "Total Revenue and Other Income", "date", new_files[num_col], None, None, 2), "value")
+
+    income_purchases_value_wr[num_col] = collect_value(search_table(income_statement_woodriver, "G/L_Account", "Purchases, COGS, Feedstocks", "date", new_files[num_col], None, None, 2), "value")
+
+
+    income_total_revenue_value_bor[num_col] = collect_value(search_table(income_statement_borger, "G/L_Account", "Total Revenue and Other Income", "date", new_files[num_col], None, None, 2), "value")
+
+    income_purchases_value_bor[num_col] = collect_value(search_table(income_statement_borger, "G/L_Account", "Purchases, COGS, Feedstocks", "date", new_files[num_col], None, None, 2), "value")
+
+    income_total_revenue_value_wr[num_col] = income_total_revenue_value_wr[num_col] if income_total_revenue_value_wr[num_col] is not None else 0
+    income_purchases_value_wr[num_col] = income_purchases_value_wr[num_col] if income_purchases_value_wr[num_col] is not None else 0
+    income_total_revenue_value_bor[num_col] = income_total_revenue_value_bor[num_col] if income_total_revenue_value_bor[num_col] is not None else 0
+    income_purchases_value_bor[num_col] = income_purchases_value_bor[num_col] if income_purchases_value_bor[num_col] is not None else 0
+
+print(price_deck_wti_value)
+print(income_total_revenue_value_wr)
+print(income_purchases_value_wr)
+print(income_total_revenue_value_bor)
+print(income_purchases_value_bor)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC Wood River (100 %, Gross)
+
+# COMMAND ----------
+
+#WoodRiver
+#100% Gross
+crude_capacity_fixed = 346.00
+
+high_tans = ["AVB-ALBIAN VACUUM BLEND", "CNX-CANADIAN NATURAL HIGH TAN", "FRB-FORT HILLS DILBIT", "WDB-WESTERN CANADA DILBIT", "KDB-KEARL DILBIT BLEND", "MKH-MACKAY RIVER HEAVY", "CDB-CHRISTINA DILBIT BLEND", "BHB-BOREALIS HEAVY BLEND", "AWB-ACCESS WESTERN BLEND", "SHD-SURMONT HEAVY DILBIT", "SH-SEAL HEAVY"]
+non_high_tans = ["CWH - CLEAR WATER HEAVY", "CWH-CLEARWATER HEAVY", "LLB-LLOYD BLEND B", "WYOMING ASPHALT SOUR", "BR-BOW RIVER", "BRS-BOW RIVER SOUTH", "WESTERN CANADIAN BLEND", "WH-WABASCA HEAVY", "WCS-WESTERN CANADIAN SELECT", "CL-COLD LAKE", "KCB-KEYSTONE CONOCOPHILLIPS BLEND", "WCB-WESTERN CANADIAN BLEND", "CHV-CONVENTIONAL HEAVY", "PCH-PREMIUM CONVENTIONAL HEAVY"]
+
+heavy = ["Crude - Heavy"]
+light = ["Crude - Sweet"]
+med = ["Crude - Light/Medium"]
+light_mediums = ["Crude - Sweet", "Crude - Light/Medium"]
+crude_oil_run = ["Crude"]
+crude_utilization = ["Utilization Calc"] #crude_oil_run - crude_capacity_fixed
+total_processed_inputs = ["Input"]
+gasoline_yield = ["Output Motor Fuel"]
+distillate_yield = ["Output Distillates"]
+refined_products = ["Output Clean Products", "Output Finished NGLs", "Output Fixed Price Products", "Output Other Products"]
+
+material_type_order = [high_tans, non_high_tans, heavy, light, med, light_mediums, crude_oil_run, crude_utilization, total_processed_inputs, gasoline_yield, distillate_yield, refined_products]
+
+calc_order = "M-bbl 60°F/Day"
+fetch_table_column = "Material"
+collect_table_column = "value"
+
+table = woodriver_cy
+starting_row = 262
+value = 0
+
+#Special Conditions - 1.Utilization Calculation is a calculation, must be specially dealt with
+
+for num_col in range(len(new_files)):
+        #Crude value fixed
+        spark_df = update_new_value(spark_df, crude_capacity_fixed, (starting_row - 1), 0, 0, [calc_order], new_files[num_col])
+
+for num_col in range(len(new_files)):
+      for num_group in range(len(material_type_order)):
+          for material in material_type_order[num_group]:
+              value_row = filter_table(table, fetch_table_column, new_dates[num_col], material, calc_order)
+              new_value = collect_value(value_row, collect_table_column)
+
+              new_value = new_value if new_value is not None else 0
+              value = value + new_value
+
+          if material == "Utilization Calc":
+            value_row = filter_table(table, fetch_table_column, new_dates[num_col], "Crude", calc_order)
+            value = collect_value(value_row, collect_table_column)
+
+            value = value if value is not None else 0
+            value = (value / crude_capacity_fixed) * 100
+
+          #Ensure a positive result
+          value = abs(value)
+
+          #Update Table
+          spark_df = update_new_value(spark_df, value, starting_row, 0, num_group, [calc_order], new_files[num_col])
+          print(new_files[num_col], num_col, num_material, num_calc)
+          print(value)
+          value = 0
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC -----------------------
+# MAGIC
+
+# COMMAND ----------
+
+spark_df = spark_df.checkpoint()
+
+# COMMAND ----------
+
+##WoodRiver
+#100% Gross
+#INDIVIDUAL CALCULATIONS
+
+clean_product_yield = "Output Clean Products"  # %PI
+
+crude_advantage = "Crude_advantage"
+feedstock_advantage = "Feedstock Advantage"
+
+realized_crack = "Realized Crack"
+
+opcost = "Opcost" 
+operated_cashflow = "Operated Cashflow"
+clean_product_realized_crack = "Clean_Product_Realized_Crack"
+other_products = "Other - Products"
+rins = "RINSs"
+
+fetch_table_column = "Material"
+collect_table_column = "value"
+
+calc_order = [clean_product_yield, crude_advantage, feedstock_advantage, realized_crack, opcost, operated_cashflow, clean_product_realized_crack, other_products, rins]
+
+table = woodriver_cy
+starting_row = 274
+value = 0
+
+for num_col in range(len(new_files)):
+    for num_calc in range(len(calc_order)):
+      
+      fetch_table_column = "Material"
+      collect_table_column = "value"
+      table = woodriver_cy
+
+      
+      #CLEAN PRODUCT YIELD
+      if calc_order[num_calc] == clean_product_yield:
+        calc_type = "%PI"
+        material = "Output Clean Products"
+        value_row = filter_table(table, fetch_table_column, new_dates[num_col], material, calc_type)
+        value = collect_value(value_row, collect_table_column)
+        
+        #Ensure a positive result
+        value = abs(value)
+
+      #CRUDE ADVANTAGE
+      elif calc_order[num_calc] == crude_advantage:
+        calc_type = "$/bbl 60°F"
+        material = "Crude"
+        value_row = filter_table(table, fetch_table_column, new_dates[num_col], material, calc_type)
+        value = collect_value(value_row, collect_table_column)
+
+        value = value if value is not None else 0
+        value = platts_list[num_col] - value
+        
+        #Ensure a positive result
+        value = abs(value)
+
+      #FEEDSTOCK ADVANTAGE
+      elif calc_order[num_calc] == feedstock_advantage:
+        calc_type = "$/bbl 60°F"
+        material = "Input"
+        value_row = filter_table(table, fetch_table_column, new_dates[num_col], material, calc_type)
+        value = collect_value(value_row, collect_table_column)
+
+        value = value if value is not None else 0
+        value = platts_list[num_col] - value  
+
+        #Ensure a positive result
+        value = abs(value)
+
+      #REALIZED CRACK
+      elif calc_order[num_calc] == realized_crack:
+        calc_type = "M-bbl 60°F"
+        material = "Input"
+        value_row = filter_table(table, fetch_table_column, new_dates[num_col], material, calc_type)
+        value = collect_value(value_row, collect_table_column)
+
+        value = value if value is not None else 0
+        realized_crack_value = (income_total_revenue_value_wr[num_col] - income_purchases_value_wr[num_col]) / 1000
+        value = realized_crack_value / value if value != 0 else realized_crack_value
+
+        #Ensure a positive result
+        value = abs(value)
+
+      #OPCOST
+      elif calc_order[num_calc] == opcost:
+        #Skip for now
+        value = None
+      
+      #OPERATED CASHFLOW
+      elif calc_order[num_calc] == operated_cashflow:
+        #Skip for now
+        value = None
+
+      #CLEAN PRODUCT REALIZED CRACK
+      elif calc_order[num_calc] == clean_product_realized_crack:
+        calc_type = "M-bbl 60°F"
+        material = "Input"
+        value_row_1 = filter_table(table, fetch_table_column, new_dates[num_col], material, calc_type)
+        value_1 = collect_value(value_row_1, collect_table_column)
+
+        calc_type = "M-bbl 60°F"
+        material = "Output Clean Products"
+        value_row_2 = filter_table(table, fetch_table_column, new_dates[num_col], material, calc_type)
+        value_2 = collect_value(value_row_2, collect_table_column)
+
+        calc_type = "M-$"
+        value_row_3 = filter_table(table, fetch_table_column, new_dates[num_col], material, calc_type)
+        value_3 = collect_value(value_row_3, collect_table_column)
+
+        value_1 = value_1 if value_1 is not None else 0
+        value_2 = value_2 if value_2 is not None else 0
+        value_3 = value_3 if value_3 is not None else 0
+        left_side = (value_3 / value_2) if value_2 != 0 else value_3
+        right_side = abs(((income_purchases_value_wr[num_col] / 1000)/ value_1)) if value_1 != 0 else abs((income_purchases_value_wr[num_col] / 1000))
+        value = left_side - right_side
+
+      #OTHER PRODUCTS
+      elif calc_order[num_calc] == other_products:
+        calc_type = "M-$"
+        material = "Output Finished NGLs"
+        value_row_1 = filter_table(table, fetch_table_column, new_dates[num_col], material, calc_type)
+        value_1 = collect_value(value_row_1, collect_table_column)
+
+        calc_type = "M-$"
+        material = "Output Fixed Price Products"
+        value_row_2 = filter_table(table, fetch_table_column, new_dates[num_col], material, calc_type)
+        value_2 = collect_value(value_row_2, collect_table_column)
+                  
+        calc_type = "M-$"
+        material = "Output Other Products"
+        value_row_3 = filter_table(table, fetch_table_column, new_dates[num_col], material, calc_type)
+        value_3 = collect_value(value_row_3, collect_table_column)
+
+        calc_type = "M-bbl 60°F"
+        material = "Output Finished NGLs"
+        value_row_4 = filter_table(table, fetch_table_column, new_dates[num_col], material, calc_type)
+        value_4 = collect_value(value_row_4, collect_table_column)
+
+        calc_type = "M-bbl 60°F"
+        material = "Output Fixed Price Products"
+        value_row_5 = filter_table(table, fetch_table_column, new_dates[num_col], material, calc_type)
+        value_5 = collect_value(value_row_5, collect_table_column)
+                  
+        calc_type = "M-bbl 60°F"
+        material = "Output Other Products"
+        value_row_6 = filter_table(table, fetch_table_column, new_dates[num_col], material, calc_type)
+        value_6 = collect_value(value_row_6, collect_table_column)
+
+        value_1 = value_1 if value_1 is not None else 0
+        value_2 = value_2 if value_2 is not None else 0
+        value_3 = value_3 if value_3 is not None else 0
+        value_4 = value_4 if value_4 is not None else 0
+        value_5 = value_5 if value_5 is not None else 0
+        value_6 = value_6 if value_6 is not None else 0
+
+        value = (value_1 + value_2 + value_3) / (value_4 + value_5 + value_6) if (value_4 + value_5 + value_6) != 0 else (value_1 + value_2 + value_3) 
+
+      #RINS
+      elif calc_order[num_calc] == rins:
+        calc_type = "M-bbl 60°F"
+        material = "Output Motor Fuel"
+        value_row_1 = filter_table(table, fetch_table_column, new_dates[num_col], material, calc_type)
+        value_1 = collect_value(value_row_1, collect_table_column)
+
+        calc_type = "M-bbl 60°F"
+        material = "Output Distillates"
+        value_row_2 = filter_table(table, fetch_table_column, new_dates[num_col], material, calc_type)
+        value_2 = collect_value(value_row_2, collect_table_column)
+                  
+        calc_type = "M-bbl 60°F"
+        material = "JET A"
+        value_row_3 = filter_table(table, fetch_table_column, new_dates[num_col], material, calc_type)
+        value_3 = collect_value(value_row_3, collect_table_column)
+
+        calc_type = "Current_Month_Actuals"
+        table = woodriver_earnings
+        fetch_table_column = "G/L_Account"
+        material = "CY RINS"
+        value_row_4 = filter_table(table, fetch_table_column, new_dates[num_col], material, calc_type)
+        value_4 = collect_value(value_row_4, collect_table_column)
+
+        value_1 = value_1 if value_1 is not None else 0
+        value_2 = value_2 if value_2 is not None else 0
+        value_3 = value_3 if value_3 is not None else 0
+        value_4 = value_4 if value_4 is not None else 0
+
+        value = -value_4 / (value_1 + (value_2-value_3)) if (value_1 + (value_2-value_3)) != 0 else -value_4
+
+      spark_df = update_new_value(spark_df, value, starting_row, 0, num_calc, [calc_order], new_files[num_col])
+      print(new_files[num_col], num_col, num_calc)
+      print(value)
+      value = 0
+
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC BORGER (100 %, Gross)
+
+# COMMAND ----------
+
+#BORGER
+#100% Gross
+crude_capacity_fixed = 149.00
+high_tans = ["AVB-ALBIAN VACUUM BLEND", "CNX-CANADIAN NATURAL HIGH TAN", "FRB-FORT HILLS DILBIT", "WDB-WESTERN CANADA DILBIT", "KDB-KEARL DILBIT BLEND", "MKH-MACKAY RIVER HEAVY", "CDB-CHRISTINA DILBIT BLEND", "BHB-BOREALIS HEAVY BLEND", "AWB-ACCESS WESTERN BLEND", "SHD-SURMONT HEAVY DILBIT", "SH-SEAL HEAVY", "KDB-KEARL DILBIT BLEND", "SHD-SURMONT HEAVY DILBIT"]
+non_high_tans = ["CWH - CLEAR WATER HEAVY", "CWH-CLEARWATER HEAVY", "LLB-LLOYD BLEND B", "WYOMING ASPHALT SOUR", "BR-BOW RIVER", "BRS-BOW RIVER SOUTH", "WESTERN CANADIAN BLEND", "WH-WABASCA HEAVY", "WCS-WESTERN CANADIAN SELECT", "CL-COLD LAKE", "KCB-KEYSTONE CONOCOPHILLIPS BLEND", "WCB-WESTERN CANADIAN BLEND", "CHV-CONVENTIONAL HEAVY", "PCH-PREMIUM CONVENTIONAL HEAVY"]
+
+
+heavy = ["Crude - Heavy"]
+light = ["Crude - Sweet"]
+med = ["Crude - Light/Medium"]
+light_mediums = ["Crude - Sweet", "Crude - Light/Medium"]
+crude_oil_run = ["Crude"]
+crude_utilization = ["Utilization Calc"] #crude_oil_run - crude_capacity_fixed
+total_processed_inputs = ["Input"]
+gasoline_yield = ["Output Motor Fuel"]
+distillate_yield = ["Output Distillates"]
+refined_products = ["Output Clean Products", "Output Finished NGLs", "Output Raw NGLs", "Output Fixed Price Products", "Output Other Products"]
+
+material_type_order = [high_tans, non_high_tans, heavy, light, med, light_mediums, crude_oil_run, crude_utilization, total_processed_inputs, gasoline_yield, distillate_yield, refined_products]
+
+calc_order = "M-bbl 60°F/Day"
+fetch_table_column = "Material"
+collect_table_column = "value"
+
+table = borger_cy
+starting_row = 284
+value = 0
+
+#Special Conditions - 1.Utilization Calculation is a calculation, must be specially dealt with
+
+for num_col in range(len(new_files)):
+        #Crude value fixed
+        spark_df = update_new_value(spark_df, crude_capacity_fixed, (starting_row - 1), 0, 0, [calc_order], new_files[num_col])
+
+for num_col in range(len(new_files)):
+      for num_group in range(len(material_type_order)):
+          for material in material_type_order[num_group]:
+              new_value_row = filter_table(table, fetch_table_column, new_dates[num_col], material, calc_order)
+              new_value = collect_value(new_value_row, collect_table_column)
+
+              new_value = new_value if new_value is not None else 0
+              value = value + new_value
+
+          if material == "Utilization Calc":
+            value_crude_row = filter_table(table, fetch_table_column, new_dates[num_col], "Crude", calc_order)
+            value_crude = collect_value(value_crude_row, collect_table_column)
+
+            value_crude = value_crude if value_crude is not None else 0
+            value = (value_crude / crude_capacity_fixed) * 100
+
+          #Ensure a positive result
+          value = abs(value)
+
+          #Update Table
+          spark_df = update_new_value(spark_df, value, starting_row, 0, num_group, [calc_order], new_files[num_col])
+          print(new_files[num_col], num_col, num_calc)
+          print(value)
+          value = 0
+
+# COMMAND ----------
+
+#BORGER
+#100% Gross
+#INDIVIDUAL CALCULATIONS
+
+clean_product_yield = "Output Clean Products"  # %PI
+
+crude_advantage = "Crude_advantage"
+feedstock_advantage = "Feedstock Advantage"
+
+realized_crack = "Realized Crack"
+
+opcost = "Opcost" 
+operated_cashflow = "Operated Cashflow"
+clean_product_realized_crack = "Clean_Product_Realized_Crack"
+other_products = "Other - Products"
+rins = "RINSs"
+
+calc_order = [clean_product_yield, crude_advantage, feedstock_advantage, realized_crack, opcost, operated_cashflow, clean_product_realized_crack, other_products, rins]
+
+starting_row = 296
+value = 0
+
+for num_col in range(len(new_files)):
+    for num_calc in range(len(calc_order)):
+      
+      fetch_table_column = "Material"
+      collect_table_column = "value"
+      table = borger_cy
+
+      #CLEAN PRODUCT YIELD
+      if calc_order[num_calc] == clean_product_yield:
+        calc_type = "%PI"
+        material = "Output Clean Products"
+        value_row = filter_table(table, fetch_table_column, new_dates[num_col], material, calc_type)
+        value = collect_value(value_row, collect_table_column)
+
+        #Ensure a positive result
+        value = abs(value)
+
+      #CRUDE ADVANTAGE
+      elif calc_order[num_calc] == crude_advantage:
+        calc_type = "$/bbl 60°F"
+        material = "Crude"
+        value_row = filter_table(table, fetch_table_column, new_dates[num_col], material, calc_type)
+        value = collect_value(value_row, collect_table_column)
+
+        value = value if value is not None else 0
+        value = platts_list[num_col] - value
+        #value = price_deck_wti_value[num_col] - value
+
+        #Ensure a positive result
+        value = abs(value)
+
+      #FEEDSTOCK ADVANTAGE
+      elif calc_order[num_calc] == feedstock_advantage:
+        calc_type = "$/bbl 60°F"
+        material = "Input"
+        value_row = filter_table(table, fetch_table_column, new_dates[num_col], material, calc_type)
+        value = collect_value(value_row, collect_table_column)
+
+        value = value if value is not None else 0
+        value = platts_list[num_col] - value
+        #value = price_deck_wti_value[num_col] - value
+        
+        #Ensure a positive result
+        value = abs(value)  
+
+      #REALIZED CRACK
+      elif calc_order[num_calc] == realized_crack:
+        calc_type = "M-bbl 60°F"
+        material = "Input"
+        value_row = filter_table(table, fetch_table_column, new_dates[num_col], material, calc_type)
+        value = collect_value(value_row, collect_table_column)
+
+        value = value if value is not None else 0
+        realized_crack_value = (income_total_revenue_value_bor[num_col] - income_purchases_value_bor[num_col]) / 1000
+        value = realized_crack_value / value if value != 0 else realized_crack_value
+
+        #Ensure a positive result
+        value = abs(value) 
+
+      #OPCOST
+      elif calc_order[num_calc] == opcost:
+        #Skip for now
+        value = None
+      
+      #OPERATED CASHFLOW
+      elif calc_order[num_calc] == operated_cashflow:
+        #Skip for now
+        value = None
+
+      #CLEAN PRODUCT REALIZED CRACK
+      elif calc_order[num_calc] == clean_product_realized_crack:
+        calc_type = "M-bbl 60°F"
+        material = "Input"
+        value_row_1 = filter_table(table, fetch_table_column, new_dates[num_col], material, calc_type)
+        value_1 = collect_value(value_row_1, collect_table_column)
+
+        calc_type = "M-bbl 60°F"
+        material = "Output Clean Products"
+        value_row_2 = filter_table(table, fetch_table_column, new_dates[num_col], material, calc_type)
+        value_2 = collect_value(value_row_2, collect_table_column)
+
+        calc_type = "M-$"
+        value_row_3 = filter_table(table, fetch_table_column, new_dates[num_col], material, calc_type)
+        value_3 = collect_value(value_row_3, collect_table_column)
+
+        value_1 = value_1 if value_1 is not None else 0
+        value_2 = value_2 if value_2 is not None else 0
+        value_3 = value_3 if value_3 is not None else 0
+        left_side = (value_3 / value_2) if value_2 != 0 else value_3
+        right_side = abs(((income_purchases_value_bor[num_col] / 1000)/ value_1)) if value_1 != 0 else abs(((income_purchases_value_bor[num_col] / 1000)))
+        value = left_side - right_side
+
+      #OTHER PRODUCTS
+      elif calc_order[num_calc] == other_products:
+        calc_type = "M-$"
+        material = "Output Finished NGLs"
+        value_1 = combine_values(borger_cy, borger_cy, new_dates[num_col], material, "Output Raw NGLs", "Material", calc_type, collect_table_column)
+
+        calc_type = "M-$"
+        material = "Output Fixed Price Products"
+        value_row_2 = filter_table(table, fetch_table_column, new_dates[num_col], material, calc_type)
+        value_2 = collect_value(value_row_2, collect_table_column)
+                  
+        calc_type = "M-$"
+        material = "Output Other Products"
+        value_row_3 = filter_table(table, fetch_table_column, new_dates[num_col], material, calc_type)
+        value_3 = collect_value(value_row_3, collect_table_column)
+
+        calc_type = "M-bbl 60°F"
+        material = "Output Finished NGLs"
+        value_4 = combine_values(borger_cy, borger_cy, new_dates[num_col], material, "Output Raw NGLs", "Material", calc_type, collect_table_column)
+
+        calc_type = "M-bbl 60°F"
+        material = "Output Fixed Price Products"
+        value_row_5 = filter_table(table, fetch_table_column, new_dates[num_col], material, calc_type)
+        value_5 = collect_value(value_row_5, collect_table_column)
+                  
+        calc_type = "M-bbl 60°F"
+        material = "Output Other Products"
+        value_row_6 = filter_table(table, fetch_table_column, new_dates[num_col], material, calc_type)
+        value_6 = collect_value(value_row_6, collect_table_column)
+
+        value_1 = value_1 if value_1 is not None else 0
+        value_2 = value_2 if value_2 is not None else 0
+        value_3 = value_3 if value_3 is not None else 0
+        value_4 = value_4 if value_4 is not None else 0
+        value_5 = value_5 if value_5 is not None else 0
+        value_6 = value_6 if value_6 is not None else 0
+
+        value = (value_1 + value_2 + value_3) / (value_4 + value_5 + value_6) if (value_4 + value_5 + value_6) != 0 else (value_1 + value_2 + value_3)
+
+      #RINS
+      elif calc_order[num_calc] == rins:
+        calc_type = "M-bbl 60°F"
+        material = "Output Motor Fuel"
+        value_row_1 = filter_table(table, fetch_table_column, new_dates[num_col], material, calc_type)
+        value_1 = collect_value(value_row_1, collect_table_column)
+
+        calc_type = "M-bbl 60°F"
+        material = "Output Distillates"
+        value_row_2 = filter_table(table, fetch_table_column, new_dates[num_col], material, calc_type)
+        value_2 = collect_value(value_row_2, collect_table_column)
+                  
+        calc_type = "M-bbl 60°F"
+        material = "JET A"
+        value_row_3 = filter_table(table, fetch_table_column, new_dates[num_col], material, calc_type)
+        value_3 = collect_value(value_row_3, collect_table_column)
+
+        calc_type = "Current_Month_Actuals"
+        table = borger_earnings
+        fetch_table_column = "G/L_Account"
+        material = "CY RINS"
+        value_row_4 = filter_table(table, fetch_table_column, new_dates[num_col], material, calc_type)
+        value_4 = collect_value(value_row_4, collect_table_column)
+
+        value_1 = value_1 if value_1 is not None else 0
+        value_2 = value_2 if value_2 is not None else 0
+        value_3 = value_3 if value_3 is not None else 0
+        value_4 = value_4 if value_4 is not None else 0
+
+        value = -value_4 / (value_1 + (value_2-value_3)) if (value_1 + (value_2-value_3)) != 0 else -value_4
+
+      spark_df = update_new_value(spark_df, value, starting_row, 0, num_calc, [calc_order], new_files[num_col])
+      print(new_files[num_col], num_col, num_calc)
+      print(value)
+      value = 0
+
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC WRB (100 % Gross)
+
+# COMMAND ----------
+
+from pyspark.sql.functions import col
+
+spark_df.createOrReplaceTempView("temp_view")
+
+woodriver_gross = spark.sql(
+    "SELECT * FROM temp_view WHERE row_id BETWEEN 261 AND 280"
+).drop("row_id").withColumn("new_row_id", monotonically_increasing_id())
+
+borger_gross = spark.sql(
+    "SELECT * FROM temp_view WHERE row_id BETWEEN 283 AND 302"
+).drop("row_id").withColumn("new_row_id", monotonically_increasing_id())
+
+starting_row = 305
+value = 0
+
+for num_col in range(len(new_files)):
+    values_list_wr = woodriver_gross.select(new_files[num_col]).rdd.flatMap(lambda x: x).collect()
+    values_list_bor = borger_gross.select(new_files[num_col]).rdd.flatMap(lambda x: x).collect()
+
+    for num_row in range(len(values_list_wr)):
+      value_wr = values_list_wr[num_row] if values_list_wr[num_row] is not None else 0
+      value_bor = values_list_bor[num_row] if values_list_bor[num_row] is not None else 0
+      value = value_wr + value_bor
+
+      #Ensure a positive result
+      value = abs(value) 
+      
+      #Update Table
+      spark_df = update_new_value(spark_df, value, starting_row, num_row, 0, "", new_files[num_col])
+      print(new_files[num_col], num_row)
+      print(value)
+
+
+# COMMAND ----------
+
+#WRB
+#100% Gross
+#FIXED INDIVIDUAL CALCULATIONS
+
+clean_product_yield = "Output Clean Products"  # %PI
+
+crude_advantage = "Crude_advantage"
+feedstock_advantage = "Feedstock Advantage"
+
+realized_crack = "Realized Crack"
+
+opcost = "Opcost" 
+operated_cashflow = "Operated Cashflow"
+clean_product_realized_crack = "Clean_Product_Realized_Crack"
+other_products = "Other - Products"
+rins = "RINSs"
+
+calc_order = [clean_product_yield, crude_advantage, feedstock_advantage, realized_crack, opcost, clean_product_realized_crack, other_products, rins]
+
+starting_row = 318
+value = 0
+
+fetch_table_column = "Material"
+collect_table_column = "value"
+table_wr = woodriver_cy
+table_bor = borger_cy
+
+for num_col in range(len(new_files)):
+  #UTILIZATION CALC
+  temp_starting_row = 313
+  crude_capacity_fixed = 495.00
+  calc_type = "M-bbl 60°F/Day"
+  value_crude_wr, value_crude_bor = get_wrb_values(table_wr, table_bor, fetch_table_column, new_dates[num_col], "Crude", calc_type, collect_table_column)
+
+  value_crude = value_crude_wr + value_crude_bor
+  value = (value_crude / crude_capacity_fixed) * 100
+
+  #Ensure a positive result
+  value = abs(value) 
+  
+  spark_df = update_new_value(spark_df, value, temp_starting_row, 0, 0, [calc_order], new_files[num_col])
+
+for num_col in range(len(new_files)):
+    for num_calc in range(len(calc_order)):
+      
+      fetch_table_column = "Material"
+      collect_table_column = "value"
+      table_wr = woodriver_cy
+      table_bor = borger_cy
+
+      #CLEAN PRODUCT YIELD
+      if calc_order[num_calc] == clean_product_yield:
+        calc_type = "M-bbl 60°F/Day"
+        material = "Output Clean Products"
+        value_wr_1, value_bor_1 = get_wrb_values(table_wr, table_bor, fetch_table_column, new_dates[num_col], material, calc_type, collect_table_column)
+
+        material = "Input"
+        value_wr_2, value_bor_2 = get_wrb_values(table_wr, table_bor, fetch_table_column, new_dates[num_col], material, calc_type, collect_table_column)
+
+        value = ((value_wr_1 + value_bor_1) / (value_wr_2 + value_bor_2)) * 100 if (value_wr_2 + value_bor_2) != 0 else ((value_wr_1 + value_bor_1) * 100)
+
+        #Ensure a positive result
+        value = abs(value)
+
+      #CRUDE ADVANTAGE
+      elif calc_order[num_calc] == crude_advantage:
+        calc_type = "M-$"
+        material = "Crude"
+        value_wr_1, value_bor_1 = get_wrb_values(table_wr, table_bor, fetch_table_column, new_dates[num_col], material, calc_type, collect_table_column)
+
+        calc_type = "M-bbl 60°F"
+        value_wr_2, value_bor_2 = get_wrb_values(table_wr, table_bor, fetch_table_column, new_dates[num_col], material, calc_type, collect_table_column)
+
+        value_1 = value_wr_1 + value_bor_1
+        value_2 = value_wr_2 + value_bor_2
+
+        value = value_1 / value_2 if value_2 != 0 else value_1
+        #Total
+        value = platts_list[num_col] - value
+        #value = price_deck_wti_value[num_col] - (value)
+
+        #Ensure a positive result
+        value = abs(value) 
+
+      #FEEDSTOCK ADVANTAGE
+      elif calc_order[num_calc] == feedstock_advantage:
+        calc_type = "M-$"
+        material = "Input"
+        value_wr_1, value_bor_1 = get_wrb_values(table_wr, table_bor, fetch_table_column, new_dates[num_col], material, calc_type, collect_table_column)
+
+        calc_type = "M-bbl 60°F"
+        value_wr_2, value_bor_2 = get_wrb_values(table_wr, table_bor, fetch_table_column, new_dates[num_col], material, calc_type, collect_table_column)
+
+        value_1 = value_wr_1 + value_bor_1
+        value_2 = value_wr_2 + value_bor_2
+
+        value = value_1 / value_2 if value_2 != 0 else value_1
+        #Total
+        value = platts_list[num_col] - value
+        #value = price_deck_wti_value[num_col] - (value)
+
+        #Ensure a positive result
+        value = abs(value) 
+
+      #REALIZED CRACK
+      elif calc_order[num_calc] == realized_crack:
+        calc_type = "M-bbl 60°F"
+        material = "Input"
+        value_wr, value_bor = get_wrb_values(table_wr, table_bor, fetch_table_column, new_dates[num_col], material, calc_type, collect_table_column)
+
+        value = value_wr + value_bor
+        realized_crack_value = ((income_total_revenue_value_wr[num_col] + income_total_revenue_value_bor[num_col]) - (income_purchases_value_wr[num_col] + income_purchases_value_bor[num_col])) / 1000
+        #Total
+        value = realized_crack_value / value if value != 0 else realized_crack_value
+        
+        #Ensure a positive result
+        value = abs(value) 
+
+      #OPCOST
+      elif calc_order[num_calc] == opcost:
+        #Skip for now
+        value = None
+
+      #CLEAN PRODUCT REALIZED CRACK
+      elif calc_order[num_calc] == clean_product_realized_crack:
+        calc_type = "M-bbl 60°F"
+        material = "Input"
+        value_wr, value_bor = get_wrb_values(table_wr, table_bor, fetch_table_column, new_dates[num_col], material, calc_type, collect_table_column)
+        value_1 = value_wr + value_bor
+
+        calc_type = "M-bbl 60°F"
+        material = "Output Clean Products"
+        value_wr, value_bor = get_wrb_values(table_wr, table_bor, fetch_table_column, new_dates[num_col], material, calc_type, collect_table_column)
+        value_2 = value_wr + value_bor
+
+        calc_type = "M-$"
+        value_wr, value_bor = get_wrb_values(table_wr, table_bor, fetch_table_column, new_dates[num_col], material, calc_type, collect_table_column)
+        value_3 = value_wr + value_bor
+        left_side = (value_3 / value_2) if value_2 != 0 else value_3
+        right_side =  abs((((income_purchases_value_wr[num_col] + income_purchases_value_bor[num_col]) / 1000)/ value_1)) if value_1 != 0 else abs((((income_purchases_value_wr[num_col] + income_purchases_value_bor[num_col]) / 1000)))
+        #Total
+        value = left_side - right_side
+
+      #OTHER PRODUCTS
+      elif calc_order[num_calc] == other_products:
+        calc_type = "M-$"
+        material = "Output Finished NGLs"
+        value_row_wr = filter_table(table_wr, fetch_table_column, new_dates[num_col], material, calc_type)
+        value_wr = collect_value(value_row_wr, collect_table_column)
+        value_bor = combine_values(borger_cy, borger_cy, new_dates[num_col], material, "Output Raw NGLs", "Material", calc_type, collect_table_column)
+        value_wr = value_wr if value_wr is not None else 0
+        value_bor = value_bor if value_bor is not None else 0
+        value_1 = value_wr + value_bor
+
+        calc_type = "M-$"
+        material = "Output Fixed Price Products"
+        value_wr, value_bor = get_wrb_values(table_wr, table_bor, fetch_table_column, new_dates[num_col], material, calc_type, collect_table_column)
+        value_2 = value_wr + value_bor
+                  
+        calc_type = "M-$"
+        material = "Output Other Products"
+        value_wr, value_bor = get_wrb_values(table_wr, table_bor, fetch_table_column, new_dates[num_col], material, calc_type, collect_table_column)
+        value_3 = value_wr + value_bor
+
+        calc_type = "M-bbl 60°F"
+        material = "Output Finished NGLs"
+        value_row_wr = filter_table(table_wr, fetch_table_column, new_dates[num_col], material, calc_type)
+        value_wr = collect_value(value_row_wr, collect_table_column)
+        value_bor = combine_values(borger_cy, borger_cy, new_dates[num_col], material, "Output Raw NGLs", "Material", calc_type, collect_table_column)
+        value_wr = value_wr if value_wr is not None else 0
+        value_bor = value_bor if value_bor is not None else 0
+        value_4 = value_wr + value_bor
+
+        calc_type = "M-bbl 60°F"
+        material = "Output Fixed Price Products"
+        value_wr, value_bor = get_wrb_values(table_wr, table_bor, fetch_table_column, new_dates[num_col], material, calc_type, collect_table_column)
+        value_5 = value_wr + value_bor
+                  
+        calc_type = "M-bbl 60°F"
+        material = "Output Other Products"
+        value_wr, value_bor = get_wrb_values(table_wr, table_bor, fetch_table_column, new_dates[num_col], material, calc_type, collect_table_column)
+        value_6 = value_wr + value_bor
+        
+        #Total
+        value = (value_1 + value_2 + value_3) / (value_4 + value_5 + value_6) if (value_4 + value_5 + value_6) != 0 else (value_1 + value_2 + value_3)
+
+      #RINS
+      elif calc_order[num_calc] == rins:
+        calc_type = "M-bbl 60°F"
+        material = "Output Motor Fuel"
+        value_wr, value_bor = get_wrb_values(table_wr, table_bor, fetch_table_column, new_dates[num_col], material, calc_type, collect_table_column)
+        value_1 = value_wr + value_bor
+
+        calc_type = "M-bbl 60°F"
+        material = "Output Distillates"
+        value_wr, value_bor = get_wrb_values(table_wr, table_bor, fetch_table_column, new_dates[num_col], material, calc_type, collect_table_column)
+        value_2 = value_wr + value_bor
+                  
+        calc_type = "M-bbl 60°F"
+        material = "JET A"
+        value_wr, value_bor = get_wrb_values(table_wr, table_bor, fetch_table_column, new_dates[num_col], material, calc_type, collect_table_column)
+        value_3 = value_wr + value_bor
+
+        calc_type = "Current_Month_Actuals"
+        table_wr = woodriver_earnings
+        table_bor = borger_earnings
+        fetch_table_column = "G/L_Account"
+        material = "CY RINS"
+        value_wr, value_bor = get_wrb_values(table_wr, table_bor, fetch_table_column, new_dates[num_col], material, calc_type, collect_table_column)
+        value_4 = value_wr + value_bor
+
+        #Total
+        value = -value_4 / (value_1 + (value_2-value_3)) if (value_1 + (value_2-value_3)) != 0 else -value_4
+
+      spark_df = update_new_value(spark_df, value, starting_row, 0, num_calc, [calc_order], new_files[num_col])
+      print(new_files[num_col], num_col, num_calc)
+      print(value)
+      value = 0
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ADD QUARTER / YTD COLUMNS
+
+# COMMAND ----------
+
+Quarter_End_Months = ["Mar", "Jun", "Sep", "Dec"]
+Quarter1 = ["Jan", "Feb", "Mar"]
+Quarter2 = ["Apr", "May", "Jun"]
+Quarter3 = ["Jul", "Aug", "Sep"]
+Quarter4 = ["Oct", "Nov", "Dec"]
+
+#ADD QUARTER COLUMNS AND YTD
+for date, yearmonth in zip(new_files, new_dates):
+    date_year = yearmonth[:4]
+
+    if any(month in date for month in Quarter_End_Months):
+        if any(month in date for month in Quarter1):
+            spark_df = add_quarter(spark_df, Quarter1, "Q1", date_year)
+        
+        elif any(month in date for month in Quarter2):
+            spark_df = add_quarter(spark_df, Quarter2, "Q2", date_year)
+        
+        elif any(month in date for month in Quarter3):
+            spark_df = add_quarter(spark_df, Quarter3, "Q3", date_year)
+        
+        else:
+            spark_df = add_quarter(spark_df, Quarter4, "Q4", date_year)
+            
+#ADD YTD COLUMN
+spark_df = add_ytd(spark_df, date_year)
+
+
+# COMMAND ----------
+
+#Reorder Columns including Quarter and YTD
+columns_excluded = ["row_id", "latest_file_date", "latest_file_desc", "processed_timestamp", "datamart_desc", "Table", "Source", "Material_Group", "Calculation"]
+columns = [col for col in spark_df.columns if col not in columns_excluded]
+
+columns = change_date_format(columns, date_list, date_number)
+columns.sort()
+
+new_columns = reverse_dates(columns)
+spark_df = spark_df.select(*columns_excluded, *new_columns)
+
+# COMMAND ----------
+
+display(spark_df)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC -------------------------
+
+# COMMAND ----------
+
+#Finds latest Column in File
+max_file_date_cy = woodriver_cy.agg({"file_date": "max"}).collect()[0][0]
+latest_file_date_path = collect_value(search_table(woodriver_cy, "file_date", max_file_date_cy, None, None, None, None, 1), "file_desc")
+print(max_file_date_cy)
+print(latest_file_date_path)
+
+# COMMAND ----------
+
+#Create File Description Columns
+spark_df = spark_df.drop('datamart_desc')
+spark_df = spark_df.drop('processed_timestamp')
+spark_df = spark_df.drop('latest_file_date')
+spark_df = spark_df.drop('latest_file_desc')
+
+# Get current time in Mountain Time
+utc_now = datetime.now(pytz.utc)
+mountain_tz = pytz.timezone('America/Denver')
+mountain_time = utc_now.astimezone(mountain_tz)
+mountain_time_str = mountain_time.strftime('%Y-%m-%d %H:%M:%S')
+    
+# Add columns to the DataFrame
+spark_df = spark_df.withColumn('processed_timestamp', lit(mountain_time_str))
+spark_df = spark_df.withColumn('latest_file_date', lit(max_file_date_cy))
+spark_df = spark_df.withColumn('latest_file_desc', lit(latest_file_date_path))
+spark_df = spark_df.withColumn('datamart_desc', lit(None))
+
+# COMMAND ----------
+
+# Reorder Columns
+spark_df = spark_df.select('latest_file_date', 'latest_file_desc', 'processed_timestamp', 'row_id', 'datamart_desc', *[col for col in spark_df.columns if col not in ['latest_file_date', 'latest_file_desc', 'processed_timestamp', 'row_id', 'datamart_desc']])
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC Create a copy for %50 Net and Append
+
+# COMMAND ----------
+
+next_row_id = spark_df.agg({"row_id": "max"}).collect()[0][0] + 1
+
+# COMMAND ----------
+
+from pyspark.sql.functions import monotonically_increasing_id, when, col, regexp_replace
+
+spark_df_halved = spark_df
+
+spark_df_halved = spark_df_halved.withColumn("row_id", monotonically_increasing_id() + next_row_id)
+
+# Reorder Columns
+spark_df_halved = spark_df_halved.select('latest_file_date', 'latest_file_desc', 'processed_timestamp', 'row_id', 'datamart_desc', *[col for col in spark_df_halved.columns if col not in ['latest_file_date', 'latest_file_desc', 'processed_timestamp', 'row_id', 'datamart_desc']])
+
+# Replace '100 %' with '50 %' in column 'Table'
+spark_df_halved = spark_df_halved.withColumn("Table", regexp_replace(col("Table"), "100 %", "50 %"))
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC Unpivot into one date column and one value column
+
+# COMMAND ----------
+
+
+# Unvpivot (Merge) Columns in Spark_DF into one column 'value'
+
+columns_to_unpivot = spark_df.columns[9:]
+    
+stack_expr = "stack({}, {}) as (date, value)".format(len(columns_to_unpivot), ", ".join([f"'{col}', `{col}`" for col in columns_to_unpivot]))
+    
+datamart_cy_table = spark_df.select("row_id", "latest_file_date", "latest_file_desc", "processed_timestamp", "datamart_desc", "Table", "Source", "Material_Group", "Calculation", expr(stack_expr))
+
+datamart_cy_table_halved = spark_df_halved.select("row_id", "latest_file_date", "latest_file_desc", "processed_timestamp", "datamart_desc", "Table", "Source", "Material_Group", "Calculation", expr(stack_expr))
+
+
+# COMMAND ----------
+
+# Divide Values by Half Except if Calculation is % PI or Actual $/Bbl
+conditions = ["% PI", "Actual $/Bbl"]
+
+datamart_cy_table_halved = datamart_cy_table_halved.withColumn(
+    "value",
+    when(
+        (~col("Calculation").isin(*conditions) | col("Calculation").isNull()) &
+        (~col("Material_Group").contains('%') &
+         ~col("Material_Group").contains('Crude Advantage') &
+         ~col("Material_Group").contains('Feedstock Advantage') &
+         ~col("Material_Group").contains('Realized Crack')),
+        col("value") / 2
+    ).otherwise(col("value"))
+)
+
+# COMMAND ----------
+
+#Combine tables by Append
+# Adding 'datamart_desc' column with respective literals
+datamart_cy_table = datamart_cy_table.withColumn('datamart_desc', lit("100% Gross"))
+datamart_cy_table_halved = datamart_cy_table_halved.withColumn('datamart_desc', lit("50% Net"))
+
+# Appending datamart_cy_table_halfed to spark_df
+datamart_cy_table = datamart_cy_table.unionByName(datamart_cy_table_halved)
+
+
+# COMMAND ----------
+
+display(datamart_cy_table)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC **LOAD MAIN TABLES**
+
+# COMMAND ----------
+
+#LOAD MAIN TABLES
+datamart_cy_table.write.format('delta').option("mergeSchema", "true").mode("overwrite").saveAsTable(main_table_path_cy)
+datamart_income_table.write.format('delta').option("mergeSchema", "true").mode("overwrite").saveAsTable(main_table_path_income)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC **LOAD VIEWS**
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC View for Charge And Yield
+
+# COMMAND ----------
+
+# List the dates to unpivot
+columns_to_remove = ["datamart_desc", "latest_file_date", "latest_file_desc", "processed_timestamp", "row_id", "Table", "Source", "Material_Group", "Calculation"]
+distinct_columns_list = [col_name for col_name in spark_df.columns if col_name not in columns_to_remove]
+print(distinct_columns_list)
+
+# COMMAND ----------
+
+spark.sql(f"""
+CREATE OR REPLACE VIEW {expanded_table_path_cy} AS
+  SELECT *
+FROM (
+    SELECT 
+    *
+    FROM {main_table_path_cy}
+)
+PIVOT (
+    SUM(value)
+    FOR date IN (
+{', '.join([f"'{col}'" for col in distinct_columns_list])}
+      )
+)
+ORDER BY row_id
+""")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC View For Income Statements
+
+# COMMAND ----------
+
+# List the dates to unpivot
+columns_to_remove = ["row_id", "table", "latest_file_date", "latest_file_desc", "processed_timestamp", "G/L_Account", "G/L_Account_Code", "Node_Lvl1", "Node_Lvl2", "Node_Lvl3", "Node_Lvl4", "Node_Lvl5", "Node_Lvl6", "Node_Lvl7", "Node_Lvl8", "Node_Lvl9"]
+distinct_columns_list = [col_name for col_name in temp_df.columns if col_name not in columns_to_remove]
+print(distinct_columns_list)
+
+# COMMAND ----------
+
+spark.sql(f"""
+CREATE OR REPLACE VIEW {expanded_table_path_income} AS
+  SELECT *
+FROM (
+    SELECT 
+    *
+    FROM {main_table_path_income}
+)
+PIVOT (
+    SUM(value)
+    FOR category IN (
+{', '.join([f"'{col}'" for col in distinct_columns_list])}
+      )
+)
+ORDER BY row_id
+""")
