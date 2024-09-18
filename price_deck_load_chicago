@@ -1,0 +1,441 @@
+# Databricks notebook source
+#Imports
+
+#%pip install openpyxl
+
+import os
+import re
+from datetime import datetime
+from pyspark.sql import DataFrame, SparkSession
+from pyspark.sql.types import StructType, StructField, StringType, DoubleType, IntegerType
+from pyspark.sql.window import Window
+from pyspark.sql.functions import lit, first, collect_set, col, when, regexp_replace, desc, last, monotonically_increasing_id, concat_ws, explode, expr, isnan, trim, to_date, avg, year, quarter, month
+import pytz
+import shutil
+import pandas as pd
+
+# COMMAND ----------
+
+#Pass in "file_path" from calling notebook 
+file_path = dbutils.widgets.get("file_path")
+forecast_version = dbutils.widgets.get("forecast_version")
+env = dbutils.widgets.get("env")
+
+# COMMAND ----------
+
+#Functions
+
+'''
+store_date, preprocess_file_name, extract_number
+Finds and returns the date based on 8 digits in the file_name
+'''
+def store_date(file_name):
+    date = extract_number(file_name)
+
+    # Insert dashes after the 4th and 6th positions
+    date = date[:4] + '-' + date[4:6] + '-' + date[6:] 
+    return date
+
+def preprocess_file_name(file_name):
+    return file_name.replace("-", "")
+
+'''
+extract_number
+Extracts the 8 digit date number from file name
+'''
+def extract_number(file_name):
+    processed_name = preprocess_file_name(file_name)
+    pattern = r'\b\d{8}\b'  # Matches a sequence of 8 digits
+    match = re.search(pattern, processed_name)
+    if match:
+        return match.group()
+    else:
+        return None
+
+'''
+filter_rows
+drops the specified range of rows
+'''
+def filter_rows(spark_df, start_row, end_row):
+    # Add a new column with unique sequential identifiers
+    spark_df = spark_df.withColumn("row_id", monotonically_increasing_id())
+
+    # Filter rows excluding the specified range
+    spark_df = spark_df.filter((col("row_id") < start_row) | (col("row_id") > end_row))
+
+    # Drop the 'row_id' column
+    spark_df = spark_df.drop("row_id")
+
+    return spark_df
+
+'''
+filter_column
+filters out a specific column from a Spark DataFrame based on its numerical index
+'''
+def filter_column(spark_df, col_num):
+    spark_df = spark_df.drop(spark_df.columns[col_num])
+
+    return spark_df
+
+
+'''
+update_value
+updates the first value of a specified column in a Spark DataFrame with a new value and returns the modified DataFrame.
+'''
+def update_value(spark_df, column_value, new_value):
+    # Add a new column with unique sequential identifiers
+    spark_df = spark_df.withColumn("row_id", monotonically_increasing_id())
+
+    # Fetching column name
+    column_name = spark_df.columns[column_value]
+
+    # Create a new DataFrame with the first value in the first column changed
+    spark_df = spark_df.withColumn(column_name, when(col("row_id") == column_value, new_value).otherwise(col(column_name)))
+
+    # Drop column "row_id" from spark_df
+    spark_df = spark_df.drop("row_id")
+
+    return spark_df
+
+'''
+copy_into_column
+Copies values from one column to another column in a Spark DataFrame based on specified string patterns
+'''
+def copy_into_column(spark_df, strings_list, target_column_name, copy_column_name):
+    for string_value in strings_list:
+        spark_df = spark_df.withColumn(target_column_name,
+                                       when(col(copy_column_name).like(f"%{string_value}%"),
+                                            col(copy_column_name)).otherwise(col(target_column_name)))
+    return spark_df
+
+'''
+forward_fill
+Forward fills existing column values into blank rows to create hierarchy setup
+'''
+def forward_fill(spark_df, column_name):
+    # Add a new column with unique sequential identifiers
+    spark_df = spark_df.withColumn("row_id", monotonically_increasing_id())
+
+    # Define a window specification
+    windowSpec = Window.orderBy("row_id").rowsBetween(Window.unboundedPreceding, 0)
+
+    # Forward fill the missing values in the specified column
+    spark_df = spark_df.withColumn(column_name, last(column_name, ignorenulls=True).over(windowSpec))
+
+    # Drop the 'row_id' column
+    spark_df = spark_df.drop("row_id")
+
+    return spark_df
+
+'''
+transpose_dataframe
+Switches the rows and columns of a Dataframe
+'''
+def transpose_dataframe(df):
+    # Transpose the DataFrame
+    df_transposed = df.transpose()
+
+    # Set the transposed row as the new column headers
+    df_transposed.columns = df_transposed.iloc[0]
+
+    # Drop the transposed row, which now contains the original headers
+    df_transposed = df_transposed.drop(df_transposed.index[0])
+
+    return df_transposed
+
+'''
+store_headers_as_row
+Store the current headers of the DataFrame as a new row and re-index the DataFrame.
+
+Args:
+df (pandas.DataFrame): Input DataFrame.
+
+Returns:
+pandas.DataFrame: DataFrame with the current headers stored as a new row.
+'''
+def store_headers_as_row(df):
+
+    # Store the current headers as a new row
+    df.loc[-1] = df.columns
+
+    # Re-index the DataFrame
+    df.index = df.index + 1
+
+    # Sort the index
+    df = df.sort_index()
+
+    return df
+
+'''
+concate_rows
+Concatenates values from column 1, column 2, and column 3 into column 1
+'''
+def concate_rows(df):
+    df.iloc[:, 0] = df.iloc[:, 0].astype(str) + "--" + df.iloc[:, 2].astype(str) + "--" + df.iloc[:, 3].astype(str)
+
+    return df
+
+
+'''
+remove_columns_containing_string
+Removes columns from the Spark DataFrame where the column name contains the specified string.
+
+Args:
+spark_df (pyspark.sql.DataFrame): Input Spark DataFrame.
+string_to_match (str): The string to match in column names for removal.
+
+Returns:
+pyspark.sql.DataFrame: DataFrame with columns containing the specified string removed.
+'''
+def remove_columns_containing_string(spark_df, string_to_match):
+    columns_to_drop = [col_name for col_name in spark_df.columns if string_to_match in col_name]
+    return spark_df.drop(*columns_to_drop)
+
+
+'''
+remove_invalid_columns
+Removes columns from a Spark DataFrame that start with a specified prefix.
+    
+Args:
+    df (DataFrame): The input Spark DataFrame.
+    prefix (str): The prefix to match for column removal.
+        
+Returns:
+        DataFrame: Spark DataFrame with columns removed that start with the specified prefix.
+'''
+def remove_invalid_columns(df: DataFrame, prefix: str) -> DataFrame:
+
+    # Get the columns of the DataFrame
+    columns = df.columns
+    
+    # Filter columns to remove those starting with the specified prefix
+    filtered_columns = [col for col in columns if not col.startswith(prefix)]
+    
+    # Select the filtered columns
+    return df.select(*filtered_columns)
+
+
+# COMMAND ----------
+
+#Extract File Date from Volume name
+
+#Store dates for each file in new list
+date_of_file = store_date(file_path)
+
+print(date_of_file)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC Execute following cells to load file (General)
+
+# COMMAND ----------
+
+#Define main variables
+#'main' is main catalog environment, 'dev' is production schema environment
+# Three tables are defined to be loaded, main, and two views for alternative purposes
+
+#if in development
+if(env == "dev"):
+    #Table Paths
+    main_table_path =''
+    price_deck_chicago_cat = ''
+    price_deck_chicago_date = ''
+    prefix = ''
+
+else:
+    main_table_path =''
+    price_deck_chicago_cat = ''
+    price_deck_chicago_date = ''
+    prefix = ''
+
+#Sheet
+file_sheet = 'Chicago Output'
+
+
+# COMMAND ----------
+
+# Read the excel file values into a pandas DataFrame
+df = pd.read_excel(file_path,
+                   skiprows=2, sheet_name=file_sheet, header=0)
+
+
+# Convert the pandas DataFrame to a Spark DataFrame
+spark_df = spark.createDataFrame(df)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC Execute following cells to adjust table view (Specific to chicago_price_deck)
+
+# COMMAND ----------
+
+# Limit column names to a length of 10 (fix date column names)
+spark_df = spark_df.toDF(*(spark_df.columns[:3] + [col[:10] for col in spark_df.columns[3:]]))
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC VIEW ONE LOAD
+
+# COMMAND ----------
+
+# Change Column Names
+spark_df = spark_df.withColumnRenamed(spark_df.columns[0], "product_code")
+spark_df = spark_df.withColumnRenamed(spark_df.columns[1], "product_description")
+spark_df = spark_df.withColumnRenamed(spark_df.columns[2], "units")
+
+#Drop Unnamed Column
+spark_df = remove_columns_containing_string(spark_df, "Unnamed")
+
+# COMMAND ----------
+
+
+# Filter first two rows
+spark_df = filter_rows(spark_df, 0, 2)
+
+
+# COMMAND ----------
+
+# Add new column for "Category"
+spark_df = spark_df.withColumn("category", lit(None))
+
+column_order = ["category"] + [col for col in spark_df.columns if col != "category"]
+spark_df = spark_df.select(column_order)
+
+# COMMAND ----------
+
+# Must Manually insert first row before forward fill
+spark_df = update_value(spark_df, 0, "Refined Products-Chicago & W.R.")
+
+# COMMAND ----------
+
+# Copy desired row values into corresponding row of the first column
+
+# Define the values you want to copy
+strings_list = [
+    "Refined Products-Chicago & W.R.",
+    "Gas Liquids -Chicago & W.R.",
+    "Chemicals & Oxygenates",
+    "Feedstocks",
+    "Miscellaneous"
+]
+
+# Fetching column names
+target_column_name = spark_df.columns[0]
+copy_column_name = spark_df.columns[1]
+
+# Iterate through strings_list and apply conditional update
+spark_df = copy_into_column(spark_df, strings_list, target_column_name, copy_column_name)
+
+# COMMAND ----------
+
+# Replace NaN values with None in all columns
+spark_df = spark_df.withColumn('category', when(isnan(col('category')), None).otherwise(col('category')))
+
+# COMMAND ----------
+
+spark_df = forward_fill(spark_df, "category")
+
+# COMMAND ----------
+
+#Filter out null columns
+spark_df = spark_df.filter(~col("units").isNull() & (col("units") != "") & (col("units") != "NaN"))
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC Execute the following to create timestamp and file_date columns
+
+# COMMAND ----------
+
+#Insert Timestamp 'prcoessed_timestamp'
+
+utc_now = datetime.now(pytz.utc)
+mountain_tz = pytz.timezone('America/Denver')
+mountain_time = utc_now.astimezone(mountain_tz)
+spark_df = spark_df.withColumn('processed_timestamp', lit(mountain_time))
+
+# COMMAND ----------
+
+#Add File Information to Table
+
+#Create File Date column
+spark_df = spark_df.withColumn('file_date', lit(date_of_file))
+spark_df = spark_df.withColumn('forecast_version', lit(forecast_version))
+spark_df = spark_df.withColumn('file_desc', lit(file_path[len(prefix):]))
+
+
+# COMMAND ----------
+
+# Remove invalid characters from column names
+new_column_names = [re.sub(r'[ .,;{}()\n\t=]', '', col) for col in spark_df.columns]
+
+# Rename the columns in the DataFrame
+spark_df = spark_df.toDF(*new_column_names)
+
+# COMMAND ----------
+
+# Reorder Columns
+spark_df = spark_df.select('file_date', 'file_desc', 'processed_timestamp', 'forecast_version', *[col for col in spark_df.columns if col not in ['file_date', 'file_desc', 'processed_timestamp', 'forecast_version']])
+
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC UNPIVOT COLUMNS
+
+# COMMAND ----------
+
+#Unvpivot (Merge) Columns in Spark_DF into one column 'value'
+
+columns_to_unpivot = spark_df.columns[8:]
+
+stack_expr = "stack({}, {}) as (period, value)".format(len(columns_to_unpivot), ", ".join([f"'{col}', `{col}`" for col in columns_to_unpivot]))
+
+unpivoted_df = spark_df.select("file_date", "file_desc", "processed_timestamp", "forecast_version", "category", "product_code", "product_description", "units", expr(stack_expr))
+
+# COMMAND ----------
+
+#Change Period to Date type
+unpivoted_df = unpivoted_df.withColumn("period", to_date(unpivoted_df["period"], "yyyy-MM-dd"))
+
+#Add Time Descriptive Columns
+unpivoted_df = unpivoted_df.withColumn("year", year("period"))
+unpivoted_df = unpivoted_df.withColumn("quarter", quarter("period"))
+unpivoted_df = unpivoted_df.withColumn("month", month("period"))
+
+unpivoted_df = unpivoted_df.na.drop()
+
+# COMMAND ----------
+
+#Reorder
+main_df = unpivoted_df.select('file_date', 'file_desc', 'processed_timestamp', 'forecast_version', 'category', 'product_code', 'product_description', 'units', 'value', 'year', 'quarter', 'month', 'period')
+
+# COMMAND ----------
+
+#Final Cleanup/Reordering Column Values 
+
+spark_df = spark_df.withColumn("category", trim(col("category")))
+main_df = main_df.withColumn("category", trim(col("category")))
+
+# Filter out rows with null, empty, or "NaN" values in the category column
+spark_df = spark_df.filter(~col("category").isNull() & (col("category") != "") & (col("category") != "NaN"))
+main_df = main_df.filter(~col("category").isNull() & (col("category") != "") & (col("category") != "NaN"))
+
+#View1
+spark_df = spark_df.orderBy("category", "product_description")
+
+#Main
+main_df = main_df.orderBy("category", "product_description")
+
+# COMMAND ----------
+
+#Load Tables Appending into Central Table
+#Adds new columns to end of existing table if new columns exist
+
+#MAIN
+main_df.write.format('delta').option("mergeSchema", "true").mode("append").saveAsTable(main_table_path)
+
+#View1
+spark_df.write.format('delta').option("mergeSchema", "true").mode("append").saveAsTable(price_deck_chicago_date)
